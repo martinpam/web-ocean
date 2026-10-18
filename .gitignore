@@ -9,3 +9,6 @@ Thumbs.db
 .vscode/
 .idea/
 *.log
+blender/renders/
+blender/*.blend
+blender/*.blend1

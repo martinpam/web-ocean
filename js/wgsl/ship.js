@@ -17,7 +17,7 @@ struct Ship {
   p1:       vec4f,     // ship world x, z, forward x, z
   p2:       vec4f,     // speed (m/s), hull half length, hull half beam, hull centre z (local)
   lant:     array<vec4f, ${MAX_LANTERNS}>,  // camera-relative lantern position, w = intensity
-  p3:       vec4f,     // reflection plane height relative to the camera, -, -, -
+  p3:       vec4f,     // reflection plane height relative to the camera, sail set (0..1), -, -
 };
 `;
 
@@ -85,7 +85,9 @@ fn flutter(v: VI) -> vec3f {
   let t = S.p0.x;
   if (id == MAT_SAIL) {
     let w = sin(t * 1.1 + v.uv.x * 0.35 + v.uv.y * 0.2) * 0.6 + sin(t * 2.3 - v.uv.y * 0.9) * 0.4;
-    return v.nrm.xyz * (w * k * 0.09 * S.p0.y);
+    // shortened sail: the canvas is gathered up towards its head (the yard)
+    let furl = (1.0 - S.p3.y) * 0.85;
+    return v.nrm.xyz * (w * k * 0.09 * S.p0.y) + vec3f(0.0, v.uv.y * furl, 0.0);
   }
   if (id == MAT_FLAG) {
     let ph = t * 6.5 - v.uv.x * 2.2;
@@ -173,9 +175,11 @@ fn smithG(NdV: f32, NdL: f32, a: f32) -> f32 {
   let d = eye - in.rel;
   let dist = length(d);
   let c = shade(in, !front, d / dist, dist);
-  // only what stands above the water is mirrored
-  if (in.rel.y < S.p3.x) { discard; }
-  return vec4f(c, 1.0);
+  // only what stands above the water is mirrored; the higher a point, the more the
+  // rough sea scatters its reflection, so tall rigging fades out
+  let h = in.rel.y - S.p3.x;
+  if (h < 0.0) { discard; }
+  return vec4f(c, exp(-max(h - 2.5, 0.0) / 7.0));
 }
 
 fn shade(in: VO, front: bool, V: vec3f, dist: f32) -> vec3f {

@@ -8,7 +8,7 @@ prof=$(mktemp -d)
 "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless=new --user-data-dir="$prof" \
   --enable-unsafe-webgpu --enable-features=Vulkan --use-angle=metal --ignore-gpu-blocklist \
   --window-size=1280,720 --no-first-run --disable-background-timer-throttling \
-  "http://localhost:8080/?w=1280&h=720&ui=0&shot=$name&$extra" >/dev/null 2>&1 &
+  "http://localhost:8080/${PAGE:-}?w=1280&h=720&ui=0&shot=$name&$extra" >/dev/null 2>&1 &
 pid=$!
 for i in {1..120}; do [[ -f "shots/$name" ]] && break; sleep 0.5; done
 sleep 0.3; kill $pid 2>/dev/null; rm -rf "$prof"

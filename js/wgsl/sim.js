@@ -385,15 +385,15 @@ fn shipFoam(p: vec2f) -> f32 {
   var f = 0.0;
   if (hw > 0.05) {
     let e = ax - hw;
-    let ring = (1.0 - smoothstep(0.0, 0.9 + 0.8 * sp, e)) * step(-0.25, e);
+    let ring = (1.0 - smoothstep(0.0, 0.5 + 0.6 * sp, e)) * step(-0.25, e);
     let bow = exp(-max(lz - bowZ, 0.0) / (3.0 + 4.0 * sp));
-    f = ring * (0.22 + 0.45 * sp + bow * (0.25 + 0.9 * sp));
+    f = ring * (0.1 + 0.28 * sp + bow * (0.2 + 0.8 * sp));
   }
   let s = lz - bowZ;
   if (s > 0.0) {
     let arm = U.ship1.z * 0.8 + 0.36 * s;
     let w = 0.35 + 0.035 * s;
-    let k = exp(-abs(ax - arm) / w) * exp(-s / 70.0) * sp * 0.8;
+    let k = exp(-abs(ax - arm) / w) * exp(-s / 60.0) * sp * 0.5;
     f = max(f, k * smoothstep(2.0, 10.0, s));
   }
   let s2 = lz - sternZ;

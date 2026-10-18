@@ -6,9 +6,9 @@
 // unorm8x4) and u32 indices. Space: metres, Y up, bow towards -Z, waterline at y = 0.
 import { SHIP, SHIP_SHADOW, SHIP_PROBE, SHIP_PROBES, SHADOW_RES, MAX_LANTERNS, HULL_STATIONS } from './wgsl/ship.js';
 
-const GU = GPUBufferUsage;
-const TU = GPUTextureUsage;
-const D2R = Math.PI / 180;
+const BUF = GPUBufferUsage;
+const TEX = GPUTextureUsage;
+const DEG = Math.PI / 180;
 const STRIDE = 28;
 const MAT_LANTERN = 7;
 const HULL_MATS = new Set([0, 6, 10]);
@@ -56,7 +56,8 @@ function analyseMesh(m) {
       hw[s] = Math.max(hw[s], Math.abs(x));
       has[s] = 1;
     }
-    if (mat === MAT_LANTERN) lantern.push(x, y, z);
+    // lanterns glow at full strength; the dimmer stern windows get no point light
+    if (mat === MAT_LANTERN && dv.getUint8(o + 26) > 250) lantern.push(x, y, z);
   }
   // fill empty stations between occupied ones
   for (let s = 0; s < HULL_STATIONS; s++) {
@@ -96,19 +97,19 @@ export async function createShip(device, R) {
   const radius = 0.5 * Math.hypot(bb[3] - bb[0], bb[4] - bb[1], bb[5] - bb[2]) + 0.5;
   const centre = [(bb[0] + bb[3]) / 2, (bb[1] + bb[4]) / 2, (bb[2] + bb[5]) / 2];
 
-  const vbuf = device.createBuffer({ size: mesh.verts.byteLength, usage: GU.VERTEX | GU.COPY_DST, label: 'ship verts' });
+  const vbuf = device.createBuffer({ size: mesh.verts.byteLength, usage: BUF.VERTEX | BUF.COPY_DST, label: 'ship verts' });
   device.queue.writeBuffer(vbuf, 0, mesh.verts);
   const iBytes = mesh.iCount * 4;
-  const ibuf = device.createBuffer({ size: iBytes, usage: GU.INDEX | GU.COPY_DST, label: 'ship idx' });
+  const ibuf = device.createBuffer({ size: iBytes, usage: BUF.INDEX | BUF.COPY_DST, label: 'ship idx' });
   device.queue.writeBuffer(ibuf, 0, new Uint8Array(mesh.dv.buffer, 64 + mesh.vCount * STRIDE, iBytes));
-  const hullBuf = device.createBuffer({ size: hull.hw.byteLength, usage: GU.STORAGE | GU.COPY_DST, label: 'hull widths' });
+  const hullBuf = device.createBuffer({ size: hull.hw.byteLength, usage: BUF.STORAGE | BUF.COPY_DST, label: 'hull widths' });
   device.queue.writeBuffer(hullBuf, 0, hull.hw);
 
-  const ubo = device.createBuffer({ size: 256, usage: GU.UNIFORM | GU.COPY_DST, label: 'ship ubo' });
+  const ubo = device.createBuffer({ size: 256, usage: BUF.UNIFORM | BUF.COPY_DST, label: 'ship ubo' });
   const U = new Float32Array(64);
   const shadowTex = device.createTexture({
     label: 'ship shadow', size: [SHADOW_RES, SHADOW_RES], format: 'depth32float',
-    usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING,
+    usage: TEX.RENDER_ATTACHMENT | TEX.TEXTURE_BINDING,
   });
   const shadowView = shadowTex.createView();
   const shadowSamp = device.createSampler({ compare: 'less', magFilter: 'linear', minFilter: 'linear' });
@@ -129,7 +130,8 @@ export async function createShip(device, R) {
       label: 'ship', layout: 'auto',
       vertex: { module: shipMod, entryPoint: 'vs', buffers: vertexBuffers },
       fragment: { module: shipMod, entryPoint: 'fs', targets: [{ format: R.HDR }] },
-      primitive: { topology: 'triangle-list', cullMode: 'none' },
+      // sails and flags are two opposite-facing sheets, so back faces are culled
+      primitive: { topology: 'triangle-list', cullMode: 'back' },
       depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
       multisample: { count: R.MSAA },
     }),
@@ -137,7 +139,7 @@ export async function createShip(device, R) {
       label: 'ship reflection', layout: 'auto',
       vertex: { module: shipMod, entryPoint: 'vsRefl', buffers: vertexBuffers },
       fragment: { module: shipMod, entryPoint: 'fsRefl', targets: [{ format: R.HDR }] },
-      primitive: { topology: 'triangle-list', cullMode: 'none' },
+      primitive: { topology: 'triangle-list', cullMode: 'front' },  // mirroring flips the winding
       depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'greater' },
     }),
     device.createRenderPipelineAsync({
@@ -165,8 +167,8 @@ export async function createShip(device, R) {
   function resize(w, h) {
     for (const t of [reflTex, reflDepth]) t && t.destroy();
     const rw = Math.max(1, w >> 1), rh = Math.max(1, h >> 1);
-    reflTex = device.createTexture({ label: 'ship refl', size: [rw, rh], format: R.HDR, usage: TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING });
-    reflDepth = device.createTexture({ label: 'ship refl depth', size: [rw, rh], format: 'depth32float', usage: TU.RENDER_ATTACHMENT });
+    reflTex = device.createTexture({ label: 'ship refl', size: [rw, rh], format: R.HDR, usage: TEX.RENDER_ATTACHMENT | TEX.TEXTURE_BINDING });
+    reflDepth = device.createTexture({ label: 'ship refl depth', size: [rw, rh], format: 'depth32float', usage: TEX.RENDER_ATTACHMENT });
     reflPass.colorAttachments[0].view = reflTex.createView();
     reflPass.depthStencilAttachment.view = reflDepth.createView();
     return reflPass.colorAttachments[0].view;
@@ -183,10 +185,10 @@ export async function createShip(device, R) {
     for (const fx of [-0.8, 0.8]) probeLocal.push(fx * hull.beam * w, midZ + fz * halfLen);
   }
   while (probeLocal.length < SHIP_PROBES * 2) probeLocal.push(0, midZ);
-  const probeUBO = device.createBuffer({ size: SHIP_PROBES * 8, usage: GU.UNIFORM | GU.COPY_DST, label: 'ship probe pts' });
+  const probeUBO = device.createBuffer({ size: SHIP_PROBES * 8, usage: BUF.UNIFORM | BUF.COPY_DST, label: 'ship probe pts' });
   const probeF = new Float32Array(SHIP_PROBES * 2);
-  const probeOut = device.createBuffer({ size: SHIP_PROBES * 4, usage: GU.STORAGE | GU.COPY_SRC, label: 'ship probe out' });
-  const probeRead = device.createBuffer({ size: SHIP_PROBES * 4, usage: GU.MAP_READ | GU.COPY_DST, label: 'ship probe read' });
+  const probeOut = device.createBuffer({ size: SHIP_PROBES * 4, usage: BUF.STORAGE | BUF.COPY_SRC, label: 'ship probe out' });
+  const probeRead = device.createBuffer({ size: SHIP_PROBES * 4, usage: BUF.MAP_READ | BUF.COPY_DST, label: 'ship probe read' });
   const bgProbe = bgOf(probePipe, [{ buffer: R.frameUBO }, { buffer: probeUBO }, R.dispView, R.samplerSim, { buffer: probeOut }]);
   const heights = new Float32Array(SHIP_PROBES);
   let probePending = false, probeCopied = false, haveHeights = false;
@@ -200,13 +202,14 @@ export async function createShip(device, R) {
 
   // ---- state ----
   const st = {
-    x: 0, z: 0, yaw: 0, speed: 0, sail: 0.6, rudder: 0, yawRate: 0,
+    // default heading: wind on the starboard quarter, as the sails are modelled
+    x: 0, z: 0, yaw: 253 * DEG, speed: 0, sail: 0.6, rudder: 0, yawRate: 0,
     heave: 0, heaveV: 0, pitch: 0, pitchV: 0, roll: 0, rollV: 0, heel: 0,
     halfLen, beam: hull.beam, midZ, radius, centre,
   };
   if (qs.get('ship')) {
     const v = qs.get('ship').split(',').map(Number);
-    st.x = v[0] || 0; st.z = v[1] || 0; st.yaw = (v[2] || 0) * D2R;
+    st.x = v[0] || 0; st.z = v[1] || 0; st.yaw = (v[2] || 0) * DEG;
   }
   if (qs.has('sail')) st.sail = Number(qs.get('sail'));
   st.speed = st.sail * MAX_SPEED * 0.6;
@@ -220,7 +223,7 @@ export async function createShip(device, R) {
     const steer = (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0);
     st.rudder += (steer - st.rudder) * Math.min(1, dt * 2.5);
     const fx = Math.sin(st.yaw), fz = -Math.cos(st.yaw);
-    const wx = Math.cos(windDirDeg * D2R), wz = Math.sin(windDirDeg * D2R);
+    const wx = Math.cos(windDirDeg * DEG), wz = Math.sin(windDirDeg * DEG);
     const along = fx * wx + fz * wz;             // 1 = running before the wind
     const cross = -fz * wx + fx * wz;            // wind towards starboard (+) / port (-)
     const t = Math.min(1, Math.max(0, (along + 0.75) / 0.8));
@@ -316,7 +319,7 @@ export async function createShip(device, R) {
       toWorld(p[0], p[1], p[2], tmp);
       U[44 + i * 4] = tmp[0] - cam.x; U[45 + i * 4] = tmp[1] - cam.y; U[46 + i * 4] = tmp[2] - cam.z; U[47 + i * 4] = 2.2;
     });
-    U[60] = st.heave - cam.y;
+    U[60] = st.heave - cam.y; U[61] = st.sail;
     device.queue.writeBuffer(ubo, 0, U);
   }
 

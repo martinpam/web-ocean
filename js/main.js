@@ -454,7 +454,7 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const cam = { x: 0, y: 2.4, z: 0, yaw: 0, pitch: -5.5 * D2R, fovY: 58 * D2R, speed: 6 };
   // ship camera: orbits the ship; yaw is relative to the ship's heading so it turns with it
-  const orbit = { yaw: 155 * D2R, pitch: -12 * D2R, dist: 62, freeCam: false };
+  const orbit = { yaw: 75 * D2R, pitch: -6 * D2R, dist: 72, freeCam: false };
   if (qs.get('orbit')) {
     const v = qs.get('orbit').split(',').map(Number);
     orbit.yaw = (v[0] || 0) * D2R; orbit.pitch = (v[1] || 0) * D2R; orbit.dist = v[2] || orbit.dist;
@@ -510,7 +510,7 @@ async function main() {
     ship.toWorld(0, 0, st.midZ, camTarget);
     camLift += (camTarget[1] * 0.5 - camLift) * Math.min(1, dt * 2);
     const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw), cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
-    const ty = 7 + camLift;
+    const ty = 10 + camLift;
     cam.x = camTarget[0] - cp * sy * orbit.dist;
     cam.y = ty - sp * orbit.dist;
     cam.z = camTarget[2] + cp * cy * orbit.dist;
