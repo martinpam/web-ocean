@@ -25,9 +25,10 @@ const write = (name, html) => {
 };
 
 // ---- readable bundle --------------------------------------------------------------------
-// the ship mesh travels inside the page as base64 (js/ship.js picks it up)
+// the ship mesh and the music travel inside the page as base64 (js/ship.js, js/main.js)
 const shipB64 = fs.readFileSync(path.join(root, 'assets/ship.bin')).toString('base64');
-const shipConst = `const SHIP_B64 = '${shipB64}';\n`;
+const musicB64 = fs.readFileSync(path.join(root, 'assets/shanty.mp3')).toString('base64');
+const shipConst = `const SHIP_B64 = '${shipB64}';\nconst MUSIC_B64 = '${musicB64}';\n`;
 let code = shipConst;
 for (const f of order) code += `// ---- ${f} ----\n${stripModuleSyntax(fs.readFileSync(path.join(root, f), 'utf8'))}\n`;
 write('ocean.html', page.replace(SCRIPT_TAG, () => `<script type="module">\n${code}\n</script>`));

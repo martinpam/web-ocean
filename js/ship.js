@@ -1,9 +1,11 @@
 // Pirate ship: mesh loading, buoyancy from the simulated sea, sailing controls, and the
 // GPU passes (sun shadow map, lit mesh, water height probe).
 // Mesh format (assets/ship.bin, little-endian): 64-byte header 'SHP1', vertexCount,
-// indexCount, -, bbox min xyz, bbox max xyz; then 28-byte vertices (pos f32x3, normal
-// snorm8x4, uv f16x2 in metres, albedo sRGB + AO unorm8x4, material id/roughness/extra
-// unorm8x4) and u32 indices. Space: metres, Y up, bow towards -Z, waterline at y = 0.
+// indexCount, -, bbox min xyz, bbox max xyz, helmsman eye xyz, neck y, -, -; then
+// 28-byte vertices (pos f32x3, normal snorm8x4, uv f16x2 in metres, albedo sRGB + AO
+// unorm8x4, material id / roughness / extra / tag unorm8x4) and u32 indices. Tags:
+// 255 = turning wheel, 200 = helmsman (extra = how much the vertex follows the wheel).
+// Space: metres, Y up, bow towards -Z, waterline at y = 0.
 import { SHIP, SHIP_SHADOW, SHIP_PROBE, SHIP_PROBES, SHADOW_RES, MAX_LANTERNS, HULL_STATIONS } from './wgsl/ship.js';
 
 const BUF = GPUBufferUsage;
@@ -34,10 +36,12 @@ function parseMesh(buf) {
   if (magic !== 'SHP1') throw new Error('bad ship mesh header');
   const vCount = dv.getUint32(4, true), iCount = dv.getUint32(8, true);
   const bbox = new Float32Array(buf, 16, 6).slice();
+  // helmsman eye position and neck height (zero in meshes without a helmsman)
+  const eyeHdr = new Float32Array(buf, 40, 4).slice();
   const verts = new Uint8Array(buf, 64, vCount * STRIDE);
   const idxOff = 64 + vCount * STRIDE;
   const indices = new Uint32Array(buf.slice(idxOff, idxOff + iCount * 4));
-  return { vCount, iCount, bbox, verts, dv };
+  return { vCount, iCount, bbox, eyeHdr, verts, dv };
 }
 
 // Half-width of the hull at the waterline per station, plus lantern positions.
@@ -47,6 +51,13 @@ function analyseMesh(m) {
   const hw = new Float32Array(HULL_STATIONS + 2);
   const has = new Uint8Array(HULL_STATIONS);
   const lantern = [];
+  // bounding boxes of the tagged parts: turning wheel (w = 255) and helmsman (w = 200)
+  const wheelBox = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
+  const crewBox = wheelBox.slice();
+  const grow = (b, x, y, z) => {
+    b[0] = Math.min(b[0], x); b[1] = Math.min(b[1], y); b[2] = Math.min(b[2], z);
+    b[3] = Math.max(b[3], x); b[4] = Math.max(b[4], y); b[5] = Math.max(b[5], z);
+  };
   for (let i = 0; i < vCount; i++) {
     const o = 64 + i * STRIDE;
     const x = dv.getFloat32(o, true), y = dv.getFloat32(o + 4, true), z = dv.getFloat32(o + 8, true);
@@ -58,6 +69,9 @@ function analyseMesh(m) {
     }
     // lanterns glow at full strength; the dimmer stern windows get no point light
     if (mat === MAT_LANTERN && dv.getUint8(o + 26) > 250) lantern.push(x, y, z);
+    const tag = dv.getUint8(o + 27);
+    if (tag === 255 && mat !== 2 && mat !== 8) grow(wheelBox, x, y, z);
+    if (tag === 200) grow(crewBox, x, y, z);
   }
   // fill empty stations between occupied ones
   for (let s = 0; s < HULL_STATIONS; s++) {
@@ -84,7 +98,16 @@ function analyseMesh(m) {
   lights.sort((a, b) => b.n - a.n);
   const lanterns = lights.slice(0, MAX_LANTERNS).map((l) => [l.x / l.n, l.y / l.n, l.z / l.n]);
   if (!isFinite(wlMin)) { wlMin = z0 * 0.8; wlMax = z1 * 0.8; beam = (bbox[3] - bbox[0]) * 0.4; }
-  return { hw, wlMin, wlMax, beam, lanterns };
+  const centreOf = (b) => (isFinite(b[0]) ? [(b[0] + b[3]) / 2, (b[1] + b[4]) / 2, (b[2] + b[5]) / 2] : [0, 0, 0]);
+  const wheel = centreOf(wheelBox);
+  const crew = centreOf(crewBox);
+  crew[1] = isFinite(crewBox[1]) ? crewBox[1] : 0;   // pivot at the feet
+  // eyes: below the hat crown, at the front half of the head; the neck a bit lower
+  const top = isFinite(crewBox[4]) ? crewBox[4] : 2;
+  const hasEye = m.eyeHdr[1] !== 0;
+  const eye = hasEye ? [m.eyeHdr[0], m.eyeHdr[1], m.eyeHdr[2]] : [crew[0], top - 0.32, crew[2] - 0.08];
+  const neck = hasEye ? m.eyeHdr[3] : top - 0.48;
+  return { hw, wlMin, wlMax, beam, lanterns, wheel, crew, eye, neck };
 }
 
 export async function createShip(device, R) {
@@ -105,8 +128,8 @@ export async function createShip(device, R) {
   const hullBuf = device.createBuffer({ size: hull.hw.byteLength, usage: BUF.STORAGE | BUF.COPY_DST, label: 'hull widths' });
   device.queue.writeBuffer(hullBuf, 0, hull.hw);
 
-  const ubo = device.createBuffer({ size: 256, usage: BUF.UNIFORM | BUF.COPY_DST, label: 'ship ubo' });
-  const U = new Float32Array(64);
+  const ubo = device.createBuffer({ size: 320, usage: BUF.UNIFORM | BUF.COPY_DST, label: 'ship ubo' });
+  const U = new Float32Array(80);
   const shadowTex = device.createTexture({
     label: 'ship shadow', size: [SHADOW_RES, SHADOW_RES], format: 'depth32float',
     usage: TEX.RENDER_ATTACHMENT | TEX.TEXTURE_BINDING,
@@ -145,6 +168,7 @@ export async function createShip(device, R) {
     device.createRenderPipelineAsync({
       label: 'ship shadow', layout: 'auto',
       vertex: { module: shadowMod, entryPoint: 'vs', buffers: vertexBuffers },
+      fragment: { module: shadowMod, entryPoint: 'fs', targets: [] },
       primitive: { topology: 'triangle-list', cullMode: 'none' },
       depthStencil: { format: 'depth32float', depthWriteEnabled: true, depthCompare: 'less' },
     }),
@@ -202,9 +226,11 @@ export async function createShip(device, R) {
 
   // ---- state ----
   const st = {
-    // default heading: wind on the starboard quarter, as the sails are modelled
-    x: 0, z: 0, yaw: 253 * DEG, speed: 0, sail: 0.6, rudder: 0, yawRate: 0,
+    // default heading: towards the setting sun, with the wind on the starboard quarter
+    // (as the sails are modelled; see windDir in main.js)
+    x: 0, z: 0, yaw: 10 * DEG, speed: 0, sail: 0.6, rudder: 0, yawRate: 0,
     heave: 0, heaveV: 0, pitch: 0, pitchV: 0, roll: 0, rollV: 0, heel: 0,
+    fill: 1, gust: 1, time: 0, tiltX: 0, tiltZ: 0,
     halfLen, beam: hull.beam, midZ, radius, centre,
   };
   if (qs.get('ship')) {
@@ -216,11 +242,13 @@ export async function createShip(device, R) {
   // basis of the ship, recomputed every frame
   const B = { r: [1, 0, 0], u: [0, 1, 0], b: [0, 0, 1], f: [0, 0, -1] };
 
-  function update(dt, keys, windDirDeg) {
+  function update(dt, keys, windDirDeg, windSpeed, swellHs) {
+    st.time += dt;
     // sails (W/S), rudder (A/D)
     if (keys.KeyW || keys.ArrowUp) st.sail = Math.min(1, st.sail + dt * 0.35);
     if (keys.KeyS || keys.ArrowDown) st.sail = Math.max(0, st.sail - dt * 0.35);
-    const steer = (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0);
+    const steer = qs.has('helm') ? Number(qs.get('helm'))
+      : (keys.KeyD || keys.ArrowRight ? 1 : 0) - (keys.KeyA || keys.ArrowLeft ? 1 : 0);
     st.rudder += (steer - st.rudder) * Math.min(1, dt * 2.5);
     const fx = Math.sin(st.yaw), fz = -Math.cos(st.yaw);
     const wx = Math.cos(windDirDeg * DEG), wz = Math.sin(windDirDeg * DEG);
@@ -228,7 +256,13 @@ export async function createShip(device, R) {
     const cross = -fz * wx + fx * wz;            // wind towards starboard (+) / port (-)
     const t = Math.min(1, Math.max(0, (along + 0.75) / 0.8));
     const windK = 0.18 + 0.82 * t * t * (3 - 2 * t);
-    const target = st.sail * MAX_SPEED * windK;
+    // sails fill with the wind abaft the beam and luff when it comes from ahead
+    const ft = Math.min(1, Math.max(0, (along + 0.85) / 0.5));
+    st.fill += (ft * ft * (3 - 2 * ft) - st.fill) * Math.min(1, dt * 1.5);
+    // gusts: stronger and more frequent in a hard wind
+    const gs = Math.min(1.5, windSpeed / 8), tt = st.time;
+    st.gust = 1 + 0.1 * gs * (Math.sin(tt * 0.37) + 0.6 * Math.sin(tt * 0.91 + 1.3) + 0.3 * Math.sin(tt * 2.3 + 0.4));
+    const target = st.sail * MAX_SPEED * windK * Math.min(1.25, 0.55 + 0.45 * gs) * (0.9 + 0.1 * st.gust);
     st.speed += (target - st.speed) * Math.min(1, dt * (target > st.speed ? 0.09 : 0.16));
     const turn = st.rudder * (0.025 + 0.075 * Math.min(1, st.speed / 4));
     st.yawRate += (turn - st.yawRate) * Math.min(1, dt * 1.2);
@@ -236,7 +270,7 @@ export async function createShip(device, R) {
     st.x += fx * st.speed * dt;
     st.z += fz * st.speed * dt;
     // heel: wind pressure on the sails plus the turn
-    const heelT = -cross * st.sail * windK * 0.09 + st.yawRate * st.speed * 0.12;
+    const heelT = -cross * st.sail * st.fill * st.gust * 0.07 * (0.6 + 0.6 * gs) + st.yawRate * st.speed * 0.12;
     st.heel += (heelT - st.heel) * Math.min(1, dt * 0.4);
 
     // fit a plane h = a + b*x + c*z to the probe heights (ship-local axes)
@@ -259,13 +293,17 @@ export async function createShip(device, R) {
       return vel + acc * dt;
     };
     st.heaveV = spring(st.heave, st.heaveV, a, 3.2, 0.55); st.heave += st.heaveV * dt;
-    st.pitchV = spring(st.pitch, st.pitchV, c, 4.0, 0.45); st.pitch += st.pitchV * dt;
-    st.rollV = spring(st.roll, st.rollV, b, 5.5, 0.22); st.roll += st.rollV * dt;
+    // roll is lightly damped with a period near the swell's, so a beam sea rocks the ship;
+    // a heavy swell (storm) works on the hull harder than the plane fit alone suggests
+    const seaK = 0.3 + 0.45 * swellHs;
+    st.pitchV = spring(st.pitch, st.pitchV, c * (0.8 + 0.12 * swellHs), 4.2, 0.3); st.pitch += st.pitchV * dt;
+    st.rollV = spring(st.roll, st.rollV, b * seaK, 7.0, 0.2); st.roll += st.rollV * dt;
 
     // orientation: heading basis tilted onto the smoothed wave plane plus heel
     const r0 = [Math.cos(st.yaw), 0, Math.sin(st.yaw)];
     const b0 = [-fx, 0, -fz];
     const gb = st.roll + Math.tan(st.heel), gc = st.pitch;
+    st.tiltZ = Math.atan(gb); st.tiltX = Math.atan(gc);
     let u = [-(gb * r0[0] + gc * b0[0]), 1, -(gb * r0[2] + gc * b0[2])];
     let l = Math.hypot(u[0], u[1], u[2]); u = u.map((v) => v / l);
     const d = b0[0] * u[0] + b0[2] * u[2];
@@ -292,7 +330,7 @@ export async function createShip(device, R) {
   }
 
   const tmp = [0, 0, 0];
-  function writeUniforms(cam, sunDir, time) {
+  function writeUniforms(cam, sunDir, time, hideHead) {
     // model: columns r, u, b, translation (camera-relative)
     U.fill(0);
     U.set([B.r[0], B.r[1], B.r[2], 0, B.u[0], B.u[1], B.u[2], 0, B.b[0], B.b[1], B.b[2], 0,
@@ -319,7 +357,10 @@ export async function createShip(device, R) {
       toWorld(p[0], p[1], p[2], tmp);
       U[44 + i * 4] = tmp[0] - cam.x; U[45 + i * 4] = tmp[1] - cam.y; U[46 + i * 4] = tmp[2] - cam.z; U[47 + i * 4] = 2.2;
     });
-    U[60] = st.heave - cam.y; U[61] = st.sail;
+    U[60] = st.heave - cam.y; U[61] = st.sail; U[62] = hideHead ? 1 : 0; U[63] = hull.neck;
+    U[64] = hull.wheel[0]; U[65] = hull.wheel[1]; U[66] = hull.wheel[2]; U[67] = -st.rudder * 2.5 * Math.PI;
+    U[68] = hull.crew[0]; U[69] = hull.crew[1]; U[70] = hull.crew[2]; U[71] = -st.tiltZ * 0.75;
+    U[72] = st.tiltX * 0.75; U[73] = st.fill; U[74] = st.gust;
     device.queue.writeBuffer(ubo, 0, U);
   }
 
@@ -360,7 +401,7 @@ export async function createShip(device, R) {
   }
 
   return {
-    st, B, ubo, hullBuf, shadowView, shadowSamp, resize, update, toWorld, writeUniforms,
+    st, B, ubo, hullBuf, crewEye: hull.eye, shadowView, shadowSamp, resize, update, toWorld, writeUniforms,
     encodeCompute, encodeShadow, encodeReflection, draw, afterSubmit,
   };
 }

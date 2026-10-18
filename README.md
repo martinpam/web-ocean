@@ -1,42 +1,74 @@
 # web-ocean — pirate ship fork
 
-This fork of [Noniv/web-ocean](https://github.com/Noniv/web-ocean) puts a sailable pirate ship on the sunset sea. The ship is a three-masted ship built procedurally in Blender. It rides the simulated FFT waves and leaves a wake. You steer it with the keyboard.
+This fork of [Noniv/web-ocean](https://github.com/Noniv/web-ocean) puts a sailable pirate ship on the sunset sea. The ship is a three-masted ship built procedurally in Blender. It has black, torn sails, and a bearded helmsman stands at the wheel. It rides the simulated FFT waves, leaves a wake, and a sea shanty plays while you sail.
 
-![The ship against the sun](docs/ship_sunset.jpg)
+![Sailing into the sunset](docs/ship_sunset.jpg)
 
-| On the sun path | Bow, rough sea |
+| Evening sea | Storm (G) |
 |---|---|
-| ![](docs/ship_sunpath.jpg) | ![](docs/ship_bow.jpg) |
+| ![](docs/ship_fin2.jpg) | ![](docs/ship_fin3.jpg) |
+| **Behind the helmsman (V)** | **Through his eyes (V)** |
+| ![](docs/ship_helm.jpg) | ![](docs/ship_eyes.jpg) |
 
 ## Sailing
 
 | Input | Action |
 |---|---|
 | W / S | Set more or less sail (the sails gather up at the yards) |
-| A / D | Helm to port / starboard |
-| Mouse (click to capture, or right-drag) | Orbit the camera around the ship |
+| A / D | Helm to port / starboard (the wheel turns, the helmsman's hands follow it) |
+| V | View: chase camera, behind the helmsman, through his eyes |
+| Mouse (click to capture, or right-drag) | Orbit the camera around the ship, or look around in the helm views |
 | Mouse wheel | Camera distance |
-| F | Switch between the chase camera and the original free camera |
+| G | Storm on/off (blends in over 8 s: wind, swell, clouds) |
+| M | Music on/off (starts with the first key press or click) |
+| F | Switch between the ship cameras and the original free camera |
 | H | Settings panel |
 
-Speed depends on the sail setting and on the angle to the wind (`windDir`). The ship is fastest with the wind on the quarter and slowest heading into it. Wind pressure and turns make the ship heel.
+Speed depends on the sail setting and on the angle to the wind (`windDir`). The start course is toward the sun with the wind on the starboard quarter. The sails fill and swell in gusts. They luff and shake when the wind comes from ahead. Wind pressure and turns make the ship heel.
 
-URL parameters for testing: `ship=x,z,headingDeg`, `sail=0..1`, `orbit=yawDeg,pitchDeg,dist` (yaw is relative to the heading), `shipmesh=assets/ship_test.bin`. `tools/shot.sh name.png "params"` renders one frame in headless Chrome into `shots/` (run `npm start` first).
+**Performance:** the render resolution adapts to keep about 60 fps. It starts at 1.5× CSS pixels on Retina screens. `?scale=1` fixes the scale at full native resolution.
+
+**URL parameters for testing:**
+- `ship=x,z,headingDeg`, `sail=0..1`, `helm=-1..1` (holds the rudder)
+- `orbit=yawDeg,pitchDeg,dist`: yaw is relative to the heading
+- `view=0|1|2`, `storm=1`, `music=0`, `debug=1` (exposes `window.ship`)
+- `shipmesh=assets/ship_test.bin`
+
+`tools/shot.sh name.png "params"` renders one frame in headless Chrome into `shots/` (run `npm start` first).
 
 ## How the ship works
 
-- **Model:** `blender/build_ship.py` builds the whole ship from code: lofted hull, gunports and cannons, stern gallery with lanterns, three masts, 12 billowed sails, shrouds and ratlines, a Jolly Roger, and AO from ray casts. It exports `assets/ship.bin` (137k triangles, 4.4 MB). Rebuild it with `blender -b --factory-startup --python blender/build_ship.py`, and add `-- --render final --views front34,sternq --samples 160` for Cycles previews. `blender/verify_bin.py` checks the file.
+- **Model:** `blender/build_ship.py` builds the whole ship from code. It makes:
+  - the lofted hull, gunports and cannons, and the stern gallery with lanterns
+  - three masts, 12 black sails with repair patches and torn feet, shrouds and ratlines, and a Jolly Roger
+  - the wheel and the helmsman (tricorn, braided beard, eye patch, red coat)
+  - weathering in the vertex colours (grime streaks, algae at the waterline, salt crust) and AO from ray casts
 
-  | Blender preview | |
-  |---|---|
-  | ![](docs/ship_blender_front34.jpg) | ![](docs/ship_blender_sternq.jpg) |
+  It exports `assets/ship.bin` (168k triangles, 5.3 MB). Rebuild it with `blender -b --factory-startup --python blender/build_ship.py`, and add `-- --render final --views front34,sternq --samples 160` for Cycles previews. `blender/verify_bin.py` checks the file.
 
-- **Mesh format:** a 64-byte header, then 28-byte vertices (position, normal, UV in metres, albedo + baked AO, material id / roughness / flutter weight), then u32 indices. `js/ship.js` documents it.
-- **Buoyancy:** a compute shader reads the displaced sea height at 10 points on the waterplane. It inverts the choppy horizontal displacement the same way as the camera probe. The CPU fits a plane to the heights. Damped springs then drive heave, pitch, and roll, each with its own natural period.
-- **Shading:** sun with a 2048² shadow map (PCF), sky light from the environment cube, GGX specular, translucent canvas when backlit, flickering lantern point lights, and the same aerial perspective as the sea. Procedural planks, caulking, butt joints, and canvas cloths add detail on top of the vertex colours. Sails breathe and the flag waves in the vertex shader.
-- **Ship and sea:** the shadow map also darkens the sea, so the hull blocks the sun glitter. A mirrored half-resolution render of the ship goes into the water reflection, distorted by the wave slopes. Tall parts fade out, because a rough sea scatters their reflection. The foam update injects a hull band, a bow wave, the two 19.5° Kelvin arms, and a torn stern wake into the world-space foam maps. That foam then decays and drifts like the whitecaps.
+  | Blender preview | | |
+  |---|---|---|
+  | ![](docs/ship_blender_front34.jpg) | ![](docs/ship_blender_sternq.jpg) | ![](docs/ship_blender_helm.jpg) |
 
-The bundled `ocean.html` / `ocean.min.html` embed the ship mesh as base64, so they are now about 5.8 MB each and still work from `file://`.
+- **Mesh format:** a 64-byte header (includes the helmsman's eye position), then 28-byte vertices, then u32 indices. Each vertex has a position, a normal, a UV in metres, albedo + baked AO, and material id / roughness / extra / tag. Tags mark the turning wheel and the helmsman. For the helmsman, "extra" is how much a vertex follows the wheel, which acts as a simple arm skin. `js/ship.js` documents the format.
+- **Buoyancy:** a compute shader reads the displaced sea height at 10 points on the waterplane. It inverts the choppy horizontal displacement. The CPU fits a plane to the heights. Damped oscillators then drive heave, pitch, and roll. Roll is lightly damped with a period near the swell's (about 7 s), and the wave forcing grows with swell height. So a calm evening rolls the ship about ±7°, and the storm rolls it about ±20°.
+- **Animation (vertex shader):**
+  - Sails swell, ripple, and luff with the wind fill and gusts. They gather up when you shorten sail.
+  - The flag streams.
+  - The wheel turns about its axle with the rudder.
+  - The helmsman's arms follow the wheel up to about 50°, and his body stays upright against the roll.
+- **Shading:**
+  - Sun with a 2048² shadow map (PCF), sky light from the environment cube, GGX specular, and translucent canvas.
+  - Procedural round holes in the sails. They also let sunlight through in the shadow map.
+  - Rain streaks, procedural planks and caulking.
+  - Flickering lantern lights, and the same aerial perspective as the sea.
+- **Ship and sea:**
+  - The shadow map darkens the sea, so the hull blocks the sun glitter.
+  - A mirrored half-resolution render of the ship goes into the water reflection.
+  - The foam update injects a hull band, a bow wave, the two 19.5° Kelvin arms, and a torn stern wake into the world-space foam maps.
+- **Music:** `assets/shanty.mp3` is an original sea shanty in the style of "What Shall We Do with the Drunken Sailor". It was made with the ElevenLabs music API.
+
+The bundled `ocean.html` / `ocean.min.html` embed the ship mesh and the music as base64, so they are about 10 MB each and still work from `file://`.
 
 ---
 
@@ -134,7 +166,7 @@ I built this with Claude Code (Opus 5.5). I asked for the most realistic water i
 | `js/main.js` | Device setup, resources, camera, per-frame loop |
 | `js/ship.js` | Ship mesh loading, buoyancy, sailing controls, shadow / reflection / probe passes |
 | `blender/` | Procedural Blender build of the ship and the mesh verifier |
-| `assets/` | `ship.bin` (the ship) and `ship_test.bin` (a crude stand-in) |
+| `assets/` | `ship.bin` (the ship), `ship_test.bin` (a crude stand-in), `shanty.mp3` (music) |
 | `js/wgsl/` | Shaders as JavaScript modules: `sim.js` (waves and foam), `sky.js` (atmosphere and clouds), `ocean.js` (surface and sky pass), `post.js` (bloom and tone mapping), `ship.js` (ship shading, shadow, buoyancy probe), `common.js` (shared structs) |
 | `server.mjs` | Tiny static server for development |
 | `build.mjs` | Builds `ocean.html` and `ocean.min.html` |

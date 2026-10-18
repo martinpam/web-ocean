@@ -3,7 +3,7 @@
 
     /usr/bin/python3 blender/verify_bin.py [path/to/ship.bin]
 
-Prints counts, bbox, material histogram, AO / extra stats and checks that every index < vertexCount,
+Prints counts, bbox, eye / neck header floats, material and material.w histograms, AO / extra stats and checks that every index < vertexCount,
 that the bbox in the header matches the vertices, and that normals are unit length.
 """
 import os
@@ -25,7 +25,9 @@ def main():
     assert data[:4] == b"SHP1", "bad magic"
     nv, ni, res = struct.unpack_from("<III", data, 4)
     bb = struct.unpack_from("<6f", data, 16)
-    pad = struct.unpack_from("<6f", data, 40)
+    eye = struct.unpack_from("<3f", data, 40)
+    neck = struct.unpack_from("<f", data, 52)[0]
+    pad = struct.unpack_from("<2f", data, 56)
     expect = 64 + nv * 28 + ni * 4
     print("file      %s  (%d bytes, expected %d)" % (path, len(data), expect))
     assert len(data) == expect, "size mismatch"
@@ -34,6 +36,7 @@ def main():
     print("vertices  %d" % nv)
     print("indices   %d  (%d triangles)" % (ni, ni // 3))
     print("bbox hdr  min (%.3f, %.3f, %.3f)  max (%.3f, %.3f, %.3f)" % bb)
+    print("eye       (%.3f, %.3f, %.3f)   neck bottom local y %.3f" % (eye + (neck,)))
 
     mn = [1e30] * 3
     mx = [-1e30] * 3
@@ -41,6 +44,7 @@ def main():
     ao_sum = [0.0] * 256
     ao_min = [1.0] * 256
     ex_max = [0] * 256
+    w_hist = {}
     bad_n = 0
     off = 64
     rec = struct.Struct("<3f4b2H4B4B")
@@ -58,6 +62,7 @@ def main():
         ao_sum[mid] += a / 255.0
         ao_min[mid] = min(ao_min[mid], a / 255.0)
         ex_max[mid] = max(ex_max[mid], extra)
+        w_hist[w] = w_hist.get(w, 0) + 1
     print("bbox data min (%.3f, %.3f, %.3f)  max (%.3f, %.3f, %.3f)" % (*mn, *mx))
     assert all(abs(mn[k] - bb[k]) < 1e-4 and abs(mx[k] - bb[3 + k]) < 1e-4 for k in range(3)), "bbox mismatch"
 
@@ -82,6 +87,7 @@ def main():
             name = MAT_NAMES[m] if m < len(MAT_NAMES) else "?"
             print(" %2d  %-8s %10d %10d   %.3f  %.3f  %5d" % (m, name, hist[m], tri_mat[m], ao_sum[m] / hist[m],
                                                            ao_min[m], ex_max[m]))
+    print("\nmaterial.w histogram: " + ", ".join("%d: %d" % kv for kv in sorted(w_hist.items())))
     print("\nOK")
 
 

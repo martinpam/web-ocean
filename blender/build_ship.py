@@ -163,6 +163,44 @@ def frame_axes(x, up=(0, 0, 1)):
     return np.array([x, y, z])
 
 
+def _hash3(ix, iy, iz, seed):
+    h = (ix.astype(np.uint64) * np.uint64(73856093)) ^ (iy.astype(np.uint64) * np.uint64(19349663)) \
+        ^ (iz.astype(np.uint64) * np.uint64(83492791)) ^ np.uint64((seed * 2654435761) & 0xFFFFFFFF)
+    h = (h ^ (h >> np.uint64(13))) * np.uint64(1274126177)
+    h = h ^ (h >> np.uint64(16))
+    return (h & np.uint64(0xFFFF)).astype(float) / 65535.0
+
+
+def vnoise(p, seed=0):
+    p = np.asarray(p, float)
+    i = np.floor(p).astype(np.int64)
+    f = p - i
+    u = f * f * (3 - 2 * f)
+    out = 0.0
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                w = (u[..., 0] if dx else 1 - u[..., 0]) * (u[..., 1] if dy else 1 - u[..., 1]) * \
+                    (u[..., 2] if dz else 1 - u[..., 2])
+                out = out + w * _hash3(i[..., 0] + dx, i[..., 1] + dy, i[..., 2] + dz, seed)
+    return out
+
+
+def fbm(p, octaves=4, seed=0):
+    p = np.asarray(p, float)
+    s, a, tot = 0.0, 1.0, 0.0
+    for k in range(octaves):
+        s = s + a * vnoise(p * (2.0 ** k), seed + 17 * k)
+        tot += a
+        a *= 0.5
+    return s / tot
+
+
+def hash1(*a, seed=0):
+    a = [np.asarray(x, np.int64) for x in a] + [np.zeros_like(np.asarray(a[0], np.int64))] * (3 - len(a))
+    return _hash3(a[0], a[1], a[2], seed)
+
+
 # ----------------------------------------------------------------------------
 # geometry accumulator
 # ----------------------------------------------------------------------------
@@ -172,6 +210,7 @@ class Acc:
         self.n = 0
         self.tag_tris = {}
         self.tag = "misc"
+        self.cur_w = 0      # material.w for everything added (0..255)
 
     def add(self, P, T, N=None, UV=None, col=(1, 1, 1), mat=0, rough=None, extra=0.0, expect=None):
         P = np.asarray(P, float).reshape(-1, 3)
@@ -198,12 +237,13 @@ class Acc:
         E = np.broadcast_to(extra.reshape(-1) if extra.size == n else extra, (n,)).astype(float)
         R = np.full(n, ROUGH[mat] if rough is None else rough)
         M = np.full(n, mat)
-        self.parts.append((P, N, UV, C, M, R, E, T + self.n))
+        W = np.full(n, float(self.cur_w))
+        self.parts.append((P, N, UV, C, M, R, E, W, T + self.n))
         self.n += n
         self.tag_tris[self.tag] = self.tag_tris.get(self.tag, 0) + len(T)
 
     def arrays(self):
-        out = [np.concatenate([p[k] for p in self.parts]) for k in range(8)]
+        out = [np.concatenate([p[k] for p in self.parts]) for k in range(9)]
         return out
 
 
@@ -501,7 +541,7 @@ def transom_pt(xn, z, off=0.0):
 # ----------------------------------------------------------------------------
 def build_hull(acc):
     acc.tag = "hull"
-    NU = 124
+    NU = 150
     t = np.linspace(0, 1, NU)
     u = 0.55 * (0.5 - 0.5 * np.cos(np.pi * t)) + 0.45 * t
     zt = np.full(NU, 4.0)
@@ -734,7 +774,7 @@ def build_hull_bands(acc):
         if not ok.any():
             continue
         ya, yb = ys[ok].min(), ys[ok].max()
-        n = 170 if bi < 4 else 70
+        n = 190 if bi < 4 else 80
         yv = np.linspace(ya, yb, n)
         zlo, zhi = flo(yv), fhi(yv)
         for side in (1, -1):
@@ -1086,23 +1126,6 @@ def build_furniture(acc, info):
             add_box(acc, (0, y + dy, zd + 0.85), np.eye(3), (0.92, 0.07, 0.05), col=HULL_D, mat=M_HULL)
         for dx in (-0.8, 0.8):
             add_box(acc, (dx, y, zd + 0.85), np.eye(3), (0.07, 0.62, 0.05), col=HULL_D, mat=M_HULL)
-    # wheel and binnacle on the quarterdeck
-    yw = -11.7
-    zq = float(deck_level(yw)) + 0.09
-    for dx in (-0.3, 0.3):
-        add_box(acc, (dx, yw, zq + 0.55), np.eye(3), (0.05, 0.12, 0.55), col=HULL_D, mat=M_HULL)
-    wc = V3(0, yw + 0.17, zq + 1.05)
-    ang = np.linspace(0, 2 * np.pi, 25)
-    ring = wc + np.stack([0.62 * np.cos(ang), np.zeros_like(ang), 0.62 * np.sin(ang)], 1)
-    add_tube(acc, ring, 0.04, sides=6, col=HULL * 1.5, mat=M_HULL)
-    for k in range(10):
-        a = 2 * math.pi * k / 10
-        d = V3(math.cos(a), 0, math.sin(a))
-        add_tube(acc, [wc, wc + d * 0.85], [0.03, 0.022], sides=5, col=HULL * 1.5, mat=M_HULL, caps=(False, True))
-    add_tube(acc, [wc - V3(0, 0.15, 0), wc + V3(0, 0.12, 0)], 0.1, sides=8, caps=(True, True), col=GOLD, mat=M_GOLD)
-    add_box(acc, (0, yw + 1.2, zq + 0.5), np.eye(3), (0.3, 0.3, 0.5), col=HULL * 1.3, mat=M_HULL)
-    add_tube(acc, [V3(0, yw + 1.2, zq + 1.0), V3(0, yw + 1.2, zq + 1.2), V3(0, yw + 1.2, zq + 1.3)],
-             [0.22, 0.22, 0.05], sides=10, caps=(True, False), col=GOLD, mat=M_GOLD)
     # catheads + anchors
     for side in (1, -1):
         yc = 13.5
@@ -1292,8 +1315,8 @@ def build_masts(acc, info):
 
 
 def flip_part(part):
-    P, N, UV, C, M, R, E, T = part
-    return (P, -N, UV, C, M, R, E, T[:, ::-1])
+    P, N, UV, C, M, R, E, W, T = part
+    return (P, -N, UV, C, M, R, E, W, T[:, ::-1])
 
 
 def disc(c, r, n, nv):
@@ -1322,32 +1345,52 @@ def build_yards(acc):
 
 
 # --- sails ---------------------------------------------------------------
-def sail_color(V, seed, U=None, reefs=()):
+SAIL_BLACK = hexc("#29231e")
+SAIL_BLEACH = hexc("#4a443b")
+SAIL_SALT = hexc("#5c5850")
+SAIL_GRIME = hexc("#17130f")
+
+
+def sail_color(U, V, seed, patches=4):
+    """Weathered black canvas. U, V in 0..1 (V down from the head)."""
+    U = np.asarray(U, float).reshape(-1)
     V = np.asarray(V, float).reshape(-1)
-    tint = 1.0 + 0.035 * math.sin(seed * 2.1)
-    warm = np.array([1.0, 0.985 + 0.01 * math.sin(seed), 0.96 + 0.02 * math.cos(seed * 1.7)])
-    shade = (1 - 0.14 * V ** 2)
-    if U is not None:
-        U = np.asarray(U, float).reshape(-1)
-        rng = np.random.default_rng(100 + seed)
-        # weathered patches (soft, slightly yellower / darker)
-        for _ in range(4):
-            cu, cv = rng.uniform(0.15, 0.85), rng.uniform(0.2, 0.9)
-            hu, hv = rng.uniform(0.05, 0.12), rng.uniform(0.05, 0.12)
-            m = smoothstep(1.0, 0.6, np.maximum(np.abs(U - cu) / hu, np.abs(V - cv) / hv))
-            shade = shade * (1 - 0.045 * m)
-        for rv in reefs:
-            shade = shade * (1 - 0.08 * np.exp(-((V - rv) / 0.03) ** 2))
-        edge = np.minimum(np.minimum(U, 1 - U), V)
-        shade = shade * (1 - 0.1 * np.exp(-edge / 0.03))
-    c = SAIL[None, :] * warm[None, :] * tint * shade[:, None]
+    rng = np.random.default_rng(100 + seed)
+    p3 = np.stack([U * 3.0, V * 3.0, np.full_like(U, seed * 1.37)], 1)
+    c = np.tile(SAIL_BLACK * (1.0 + 0.06 * math.sin(seed * 2.1)), (len(U), 1))
+    # sun-bleached areas (stronger high up)
+    b = smoothstep(0.5, 0.78, fbm(p3, 4, seed=11)) * (0.55 + 0.45 * (1 - V))
+    c = c + (SAIL_BLEACH - c) * b[:, None] * 0.85
+    # salt stains: vertical streaks, more toward the foot
+    st = smoothstep(0.62, 0.85, fbm(np.stack([U * 14.0, V * 1.6, np.full_like(U, seed)], 1), 3, seed=12)) * V ** 0.7
+    c = c + (SAIL_SALT - c) * st[:, None] * 0.45
+    # grime near the foot and along the edges (bolt ropes)
+    c = c + (SAIL_GRIME - c) * (0.75 * V ** 3)[:, None]
+    edge = np.minimum(np.minimum(U, 1 - U), V)
+    c = c * (1 - 0.18 * np.exp(-edge / 0.03))[:, None]
+    # sewn-on repair patches (rectangles of another tone)
+    for _ in range(patches):
+        cu, cv = rng.uniform(0.15, 0.85), rng.uniform(0.15, 0.85)
+        hu, hv = rng.uniform(0.04, 0.09), rng.uniform(0.035, 0.08)
+        m = smoothstep(1.0, 0.8, np.maximum(np.abs(U - cu) / hu, np.abs(V - cv) / hv))
+        tone = SAIL_BLACK * rng.choice([0.7, 1.45, 1.75]) * np.array([1.0, rng.uniform(0.95, 1.03), rng.uniform(0.9, 1.0)])
+        c = c + (tone - c) * m[:, None]
     return np.clip(c, 0, 1)
 
 
-def square_sail(acc, TL, TR, BL, BR, wind_n, depth, nu=24, nv=18, roach=0.0, seed=0, reefs=()):
+def square_sail(acc, TL, TR, BL, BR, wind_n, depth, nu=24, nv=18, roach=0.0, seed=0, reefs=(), torn=False):
     u = np.linspace(0, 1, nu)
     v = np.linspace(0, 1, nv)
     U, Vv = np.meshgrid(u, v, indexing="ij")
+    if torn:
+        rng = np.random.default_rng(500 + seed)
+        r = rng.uniform(0.0, 0.07, nu) * np.where(np.arange(nu) % 2 == 0, 1.0, 0.35)
+        for k in rng.choice(np.arange(3, nu - 3), 3, replace=False):
+            r[k] = rng.uniform(0.12, 0.2)
+            r[k - 1] = max(r[k - 1], r[k] * 0.5)
+        r[:2] = 0.0
+        r[-2:] = 0.0
+        Vv = Vv - r[:, None] * Vv ** 6
     uc = 2 * U - 1
     head = TL[None, None] * (1 - U)[..., None] + TR[None, None] * U[..., None]
     foot = BL[None, None] * (1 - U)[..., None] + BR[None, None] * U[..., None]
@@ -1363,12 +1406,15 @@ def square_sail(acc, TL, TR, BL, BR, wind_n, depth, nu=24, nv=18, roach=0.0, see
     wtop = np.linalg.norm(TR - TL)
     wbot = np.linalg.norm(BR - BL)
     hgt = np.linalg.norm((TL + TR) / 2 - (BL + BR) / 2)
-    UV = np.stack([U * (wtop * (1 - Vv) + wbot * Vv), Vv * hgt], -1)
+    UV = np.stack([(U - 0.5) * (wtop * (1 - Vv) + wbot * Vv), Vv * hgt], -1)
     f = np.sqrt(Vv) * (1 - np.abs(uc) ** 4 * Vv ** 2) * (0.75 + 0.25 * (1 - uc ** 2))
     extra = np.clip(f, 0, 1) * 255
     T = grid_tris(nu, nv)
-    add_cloth(acc, P.reshape(-1, 3), T, UV.reshape(-1, 2), sail_color(Vv, seed, U, reefs), extra.ravel(), M_SAIL, wind_n)
-    return P
+    col = sail_color(U, Vv, seed).reshape(nu, nv, 3)
+    for rv in reefs:
+        col = col * (1 - 0.25 * np.exp(-((Vv - rv) / 0.025) ** 2))[..., None]
+    add_cloth(acc, P.reshape(-1, 3), T, UV.reshape(-1, 2), col.reshape(-1, 3), extra.ravel(), M_SAIL, wind_n)
+    return P, hgt
 
 
 def tri_sail(acc, H, Tk, C, wind_n, depth, n=18, seed=0):
@@ -1395,10 +1441,10 @@ def tri_sail(acc, H, Tk, C, wind_n, depth, n=18, seed=0):
                 T.append((idx[(i, j)], idx[(i + 1, j + 1)], idx[(i, j + 1)]))
     hd = nrm(V3(*(C - Tk)[:2], 0))
     UV = np.stack([(P - Tk) @ hd - ((H - Tk) @ hd) * a, H[2] - P[:, 2]], 1)
-    UV[:, 0] -= UV[:, 0].min()
+    UV[:, 0] -= 0.5 * (UV[:, 0].min() + UV[:, 0].max())
     extra = np.clip(np.minimum(1, 2.2 * c) * (1 - c ** 4) * (0.6 + 0.4 * (1 - b)), 0, 1) * 255
     Vv = (H[2] - P[:, 2]) / max(H[2] - min(Tk[2], C[2]), 1e-3)
-    add_cloth(acc, P, np.array(T), UV, sail_color(Vv, seed), extra, M_SAIL, wind_n)
+    add_cloth(acc, P, np.array(T), UV, sail_color(c, Vv, seed, patches=2), extra, M_SAIL, wind_n)
 
 
 def quad_sail_fa(acc, throat, peak, tack, clew, wind_n, depth, nu=20, nv=18, seed=0):
@@ -1413,10 +1459,14 @@ def quad_sail_fa(acc, throat, peak, tack, clew, wind_n, depth, nu=20, nv=18, see
     P = P + wind_n[None, None, :] * D[..., None]
     hl = np.linalg.norm(clew - tack)
     hh = np.linalg.norm(throat - tack)
-    UV = np.stack([U * hl, Vv * hh], -1)
+    UV = np.stack([(U - 0.5) * hl, Vv * hh], -1)
     extra = np.clip(U ** 0.8 * np.sin(np.pi * Vv) ** 0.5, 0, 1) * 255
-    add_cloth(acc, P.reshape(-1, 3), grid_tris(nu, nv), UV.reshape(-1, 2), sail_color(Vv, seed, U), extra.ravel(),
+    add_cloth(acc, P.reshape(-1, 3), grid_tris(nu, nv), UV.reshape(-1, 2), sail_color(U, Vv, seed, patches=3), extra.ravel(),
               M_SAIL, wind_n)
+
+
+SKULL_SAILS = set()   # no skull sails any more: all sails carry material.w = 0
+TORN_SAILS = {("main", "course"), ("fore", "topsail"), ("mizzen", "topsail")}
 
 
 def build_sails(acc, info):
@@ -1446,9 +1496,17 @@ def build_sails(acc, info):
                 BR = lo["c"] + YDIR * (lo["L"] / 2 - 0.55) + V3(0, 0, lo["r"] + 0.08) + YFWD * 0.3
                 roach = 0.25
                 d = depth[name] * (0.75 if m == "mizzen" else 1.0)
-            nu, nv = (26, 34) if name != "tgallant" else (18, 16)
-            P = square_sail(acc, TL, TR, BL, BR, YFWD, d, nu=nu, nv=nv, roach=roach, seed=seed,
-                            reefs=(0.12, 0.24, 0.36) if name == "topsail" else ((0.15,) if name == "course" else ()))
+            nu, nv = (32, 34) if name != "tgallant" else (18, 16)
+            key = (m, name)
+            # height for the skull sails (decimetres in material.w)
+            hgt_est = float(np.linalg.norm((TL + TR) / 2 - (BL + BR) / 2))
+            acc.cur_w = int(np.clip(round(hgt_est * 10), 1, 254)) if key in SKULL_SAILS else 0
+            P, hgt = square_sail(acc, TL, TR, BL, BR, YFWD, d, nu=nu, nv=nv, roach=roach, seed=seed,
+                                 reefs=(0.12, 0.24, 0.36) if name == "topsail" else ((0.15,) if name == "course" else ()),
+                                 torn=key in TORN_SAILS)
+            if key in SKULL_SAILS:
+                info.setdefault("skull_sails", []).append((m + " " + name, hgt, acc.cur_w))
+            acc.cur_w = 0
             sails[(m, name)] = dict(TL=TL, TR=TR, BL=P[0, -1], BR=P[-1, -1])
             if name in ("course", "topsail"):
                 nu_ = P.shape[0]
@@ -1569,7 +1627,7 @@ def build_flag(acc, info):
     P2 = ft[None, None, :] + (U2 + 0.05)[..., None] * d + (-(V2 * hgt) - 0.25 * (U2 / L2) ** 2)[..., None] * V3(0, 0, 1) \
         + rp[..., None] * perp
     add_cloth(acc, P2.reshape(-1, 3), grid_tris(NU2, NV2), np.stack([U2, V2 * hgt], -1).reshape(-1, 2),
-              hexc("#7a1812"), (np.clip(U2 / L2, 0, 1) * 255).ravel(), M_FLAG, perp, thick=0.008)
+              hexc("#101010"), (np.clip(U2 / L2, 0, 1) * 255).ravel(), M_FLAG, perp, thick=0.008)
 
 
 # --- bowsprit -------------------------------------------------------------
@@ -1795,6 +1853,481 @@ def ratlines(acc, lines, z0, z1, step=0.4):
 
 
 # ----------------------------------------------------------------------------
+# generic smooth primitives (used for the helmsman and the wheel)
+# ----------------------------------------------------------------------------
+def add_ellipsoid(acc, c, radii, axes=None, col=(1, 1, 1), mat=M_PAINT, rough=None, nu=20, nv=14,
+                  bump=0.0, bump_freq=6.0, seed=0, zcut=None):
+    """Ellipsoid (optionally bumpy). axes rows = local x, y, z. zcut: keep only local z >= zcut*rz (dome)."""
+    c = np.asarray(c, float)
+    axes = np.eye(3) if axes is None else np.asarray(axes, float)
+    radii = np.asarray(radii, float)
+    th0 = 0.0
+    th1 = np.pi if zcut is None else math.acos(max(-1.0, min(1.0, zcut)))
+    th = np.linspace(th0, th1, nv)
+    ph = np.linspace(0, 2 * np.pi, nu + 1)
+    TH, PH = np.meshgrid(th, ph, indexing="ij")
+    d = np.stack([np.sin(TH) * np.cos(PH), np.sin(TH) * np.sin(PH), np.cos(TH)], -1)
+    sc = 1.0
+    if bump:
+        sc = 1.0 + bump * (2 * fbm(d * bump_freq + seed * 3.1, 3, seed=seed) - 1)
+    G = c + (d * radii * (sc[..., None] if bump else 1.0)) @ axes
+    T = grid_tris(nv, nu + 1)
+    Pf = G.reshape(-1, 3)
+    fn = face_normals(Pf, T)
+    cen = (Pf[T[:, 0]] + Pf[T[:, 1]] + Pf[T[:, 2]]) / 3
+    if np.einsum("ij,ij->i", fn, cen - c).sum() < 0:
+        T = T[:, ::-1]
+    N = vertex_normals(Pf, T).reshape(G.shape)
+    seam = nrm(N[:, 0] + N[:, -1])
+    N[:, 0] = seam
+    N[:, -1] = seam
+    N[0, :] = nrm(N[0, :].sum(0))
+    if zcut is None:
+        N[-1, :] = nrm(N[-1, :].sum(0))
+    UV = np.stack([PH * radii.mean(), TH * radii.mean()], -1)
+    add_grid(acc, G, UV=UV, N=N, col=col, mat=mat, rough=rough)
+
+
+def add_loft(acc, pts, rx, ry, ref, sides=16, col=(1, 1, 1), mat=M_PAINT, rough=None, caps=(False, False),
+             a0=0.0, a1=2 * np.pi, double=None, inset=0.012):
+    """Elliptic loft along pts. rx along ref, ry along cross(t, ref). a0/a1 may be per-ring arrays
+    (open sheet). double = colour of the inner sheet for open sheets."""
+    pts = np.asarray(pts, float)
+    k = len(pts)
+    rx = np.broadcast_to(np.asarray(rx, float), (k,))
+    ry = np.broadcast_to(np.asarray(ry, float), (k,))
+    a0 = np.broadcast_to(np.asarray(a0, float), (k,))
+    a1 = np.broadcast_to(np.asarray(a1, float), (k,))
+    t = nrm(np.gradient(pts, axis=0))
+    ref = np.asarray(ref, float)
+    n = nrm(ref[None, :] - (t @ ref)[:, None] * t)
+    b = np.cross(t, n)
+    f = np.linspace(0, 1, sides + 1)
+    ang = a0[:, None] + (a1 - a0)[:, None] * f[None, :]
+    ca, sa = np.cos(ang)[..., None], np.sin(ang)[..., None]
+    off = ca * rx[:, None, None] * n[:, None, :] + sa * ry[:, None, None] * b[:, None, :]
+    nn = nrm(ca / rx[:, None, None] * n[:, None, :] + sa / ry[:, None, None] * b[:, None, :])
+    G = pts[:, None, :] + off
+    s = np.concatenate([[0], np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))])
+    UV = np.stack(np.broadcast_arrays(s[:, None], ang * 0.5 * (rx + ry)[:, None]), -1)
+    closed = np.allclose(a1 - a0, 2 * np.pi)
+    if closed:
+        N = nn.copy()
+        add_grid(acc, G, UV=UV, N=N, col=col, mat=mat, rough=rough)
+    else:
+        add_grid(acc, G, UV=UV, N=nn, col=col, mat=mat, rough=rough)
+        if double is not None:
+            add_grid(acc, G - nn * inset, UV=UV, N=-nn, col=double, mat=mat, rough=rough)
+    for e, sgn in ((0, -1), (k - 1, 1)):
+        if caps[0 if e == 0 else 1]:
+            ring = G[e, :-1] if closed else G[e]
+            m = len(ring)
+            Pc = np.vstack([pts[e], ring])
+            Tc = [(0, 1 + i, 1 + (i + 1) % m) for i in range(m if closed else m - 1)]
+            acc.add(Pc, Tc, N=np.tile(sgn * t[e], (len(Pc), 1)), col=col if np.size(col) == 3 else col[0],
+                    mat=mat, rough=rough)
+
+
+# ----------------------------------------------------------------------------
+# ship's wheel (rotating part has material.w = 255)
+# ----------------------------------------------------------------------------
+WHEEL_Y = -11.6          # Blender y of the wheel plane (before the CB shift)
+WHEEL_H = 0.95           # axle height above the deck
+WHEEL_ROT = math.pi / 10 # spoke phase: handles at 18 + 36k degrees
+GRIP_A = math.radians(54)
+GRIP_R = 0.575           # hands grip the handle roots just outside the rim
+WHEEL_HANDLE_R = 0.665   # radius of the handle grips
+
+
+def wheel_centre():
+    zq = float(deck_level(WHEEL_Y)) + 0.09
+    return V3(0, WHEEL_Y, zq + WHEEL_H), zq
+
+
+def build_helm(acc, info):
+    acc.tag = "helm"
+    wc, zq = wheel_centre()
+    yw = WHEEL_Y
+    wood = hexc("#5a3b22")
+    # --- stand (static): base plank, two turned posts, drum with tiller ropes, iron axle
+    add_box(acc, (0, yw + 0.45, zq + 0.04), np.eye(3), (0.26, 0.42, 0.04), col=HULL_D, mat=M_HULL)
+    for yy in (yw + 0.16, yw + 0.74):
+        zz = np.linspace(zq + 0.06, wc[2] - 0.15, 9)
+        rr = np.interp(zz - zq, [0, 0.1, 0.2, 0.35, 0.55, 0.75, 0.95], [0.11, 0.09, 0.065, 0.08, 0.055, 0.075, 0.09])
+        add_tube(acc, [V3(0, yy, z) for z in zz], rr, sides=12, caps=(False, True), col=wood, mat=M_HULL)
+    add_tube(acc, [wc + V3(0, 0.1, 0), wc + V3(0, 0.8, 0)], 0.16, sides=16, caps=(True, True), col=wood * 1.1,
+             mat=M_HULL)
+    for yy in (0.13, 0.77):
+        add_tube(acc, [wc + V3(0, yy - 0.025, 0), wc + V3(0, yy + 0.025, 0)], 0.172, sides=16, col=IRON, mat=M_IRON)
+    for k in range(5):
+        a = np.linspace(0, 2 * np.pi, 13)
+        yy = 0.25 + 0.1 * k
+        add_tube(acc, wc + np.stack([0.168 * np.cos(a), np.full(13, yy), 0.168 * np.sin(a)], 1), 0.016, sides=4,
+                 col=HEMP, mat=M_ROPE)
+    add_tube(acc, [wc + V3(0, -0.09, 0), wc + V3(0, 0.85, 0)], 0.03, sides=8, caps=(True, True), col=IRON, mat=M_IRON)
+    # --- rotating wheel
+    acc.cur_w = 255
+    ang = np.linspace(0, 2 * np.pi, 49)
+    for rc, w_, h_ in ((0.5, 0.055, 0.07),):
+        ring = wc + np.stack([rc * np.sin(ang), np.zeros_like(ang), rc * np.cos(ang)], 1)
+        add_sweep(acc, ring, rect(w_, h_), col=wood, mat=M_SPAR, side_hint=(0, 1, 0), caps=False)
+    ring = wc + np.stack([0.5 * np.sin(ang), np.full_like(ang, -0.04), 0.5 * np.cos(ang)], 1)
+    add_tube(acc, ring, 0.012, sides=5, col=GOLD, mat=M_GOLD)
+    for k in range(10):
+        a = 2 * np.pi * k / 10 + WHEEL_ROT
+        d = V3(math.sin(a), 0, math.cos(a))
+        # spoke inside the rim
+        tt = np.linspace(0.09, 0.47, 6)
+        add_tube(acc, [wc + d * t_ for t_ in tt], [0.03, 0.022, 0.028, 0.02, 0.022, 0.024], sides=8, col=wood,
+                 mat=M_SPAR)
+        # turned handle outside the rim
+        tt = np.linspace(0.52, 0.775, 9)
+        rr = np.interp(tt, [0.52, 0.56, 0.6, 0.64, 0.67, 0.7, 0.735, 0.76, 0.775],
+                       [0.026, 0.02, 0.03, 0.026, 0.031, 0.026, 0.024, 0.02, 0.008])
+        add_tube(acc, [wc + d * t_ for t_ in tt], rr, sides=8, col=wood * 1.15, mat=M_SPAR)
+    # brass hub with bosses
+    add_tube(acc, [wc + V3(0, -0.075, 0), wc + V3(0, -0.06, 0), wc + V3(0, 0.06, 0), wc + V3(0, 0.075, 0)],
+             [0.07, 0.1, 0.1, 0.07], sides=16, caps=(True, True), col=GOLD, mat=M_GOLD)
+    add_tube(acc, [wc + V3(0, -0.11, 0), wc + V3(0, -0.075, 0)], [0.035, 0.05], sides=12, caps=(True, False),
+             col=GOLD, mat=M_GOLD)
+    acc.cur_w = 0
+    # binnacle ahead of the stand
+    yb = yw + 1.45
+    add_box(acc, (0, yb, zq + 0.5), np.eye(3), (0.28, 0.28, 0.5), col=HULL * 1.3, mat=M_HULL)
+    add_tube(acc, [V3(0, yb, zq + 1.0), V3(0, yb, zq + 1.2), V3(0, yb, zq + 1.3)], [0.22, 0.22, 0.05], sides=12,
+             caps=(True, False), col=GOLD, mat=M_GOLD)
+    info["wheel_centre"] = wc
+    info["deck_helm"] = zq
+
+
+# ----------------------------------------------------------------------------
+# the helmsman (material.w = 200)
+# ----------------------------------------------------------------------------
+SKIN = hexc("#a86e4b")
+SKIN_D = hexc("#8e5a3c")
+COAT = hexc("#4d1611")
+COAT_IN = hexc("#2a0e0b")
+SHIRT = hexc("#cfc5b0")
+TROUSER = hexc("#2b231c")
+BOOT = hexc("#1a110b")
+BELT = hexc("#25170e")
+HATC = hexc("#141110")
+BEARD = hexc("#140f0c")
+HAIRC = hexc("#1a130f")
+
+
+def solve_elbow(S, W, L1, L2, pole):
+    d = np.linalg.norm(W - S)
+    d = min(d, L1 + L2 - 0.005)
+    u = nrm(W - S)
+    a = (L1 * L1 - L2 * L2 + d * d) / (2 * d)
+    h = math.sqrt(max(L1 * L1 - a * a, 0))
+    pp = nrm(pole - np.dot(pole, u) * u)
+    return S + u * a + pp * h, S + u * d
+
+
+def arm_follow_weights(acc, part0, chain):
+    """material.z (extra) = arm-follow weight: 0 at the shoulder, ~60 mid upper arm, ~120 elbow,
+    ~180 mid forearm, 255 on wrist/hand. Arc-length parameter of the nearest point on the chain."""
+    chain = [np.asarray(c, float) for c in chain]
+    seg_len = [np.linalg.norm(b - a) for a, b in zip(chain[:-1], chain[1:])]
+    cum = np.concatenate([[0], np.cumsum(seg_len)])
+    L1, L2 = cum[1], cum[2] - cum[1]
+    knots_s = [0.0, 0.07, 0.5 * L1, L1, L1 + 0.5 * L2, cum[2] - 0.03, cum[2] + 0.02]
+    knots_w = [0.0, 0.0, 60.0, 120.0, 180.0, 240.0, 255.0]
+    for pi in range(part0, len(acc.parts)):
+        P, N, UV, C, M, R, E, W, T = acc.parts[pi]
+        best_d = np.full(len(P), 1e9)
+        best_s = np.zeros(len(P))
+        for k, (a, b) in enumerate(zip(chain[:-1], chain[1:])):
+            ab = b - a
+            t = np.clip(((P - a) @ ab) / max(ab @ ab, 1e-9), 0, 1)
+            d = np.linalg.norm(P - (a + t[:, None] * ab), axis=1)
+            better = d < best_d
+            best_d[better] = d[better]
+            best_s[better] = cum[k] + t[better] * seg_len[k]
+        E2 = np.interp(best_s, knots_s, knots_w)
+        acc.parts[pi] = (P, N, UV, C, M, R, E2, W, T)
+
+
+def build_pirate(acc, info):
+    acc.tag = "pirate"
+    acc.cur_w = 200
+    wc = info["wheel_centre"]
+    zq = info["deck_helm"]
+    O = V3(0, WHEEL_Y - 0.40, zq)          # foot pivot: between the feet, on the deck
+    info["pirate_pivot"] = O
+
+    def L(x, y, z):
+        return O + V3(x, y, z)
+    # ---- legs and boots
+    for s in (1, -1):
+        hip = L(s * 0.095, 0.0, 0.93)
+        knee = L(s * 0.11, 0.045, 0.5)
+        ank = L(s * 0.12, 0.0, 0.1)
+        pts = [hip + (knee - hip) * t for t in np.linspace(-0.1, 1.15, 8)]
+        add_loft(acc, pts, np.linspace(0.088, 0.06, 8), np.linspace(0.095, 0.066, 8), (1, 0, 0), sides=14,
+                 col=TROUSER, rough=0.85)
+        pts = [L(s * 0.112, 0.04, z) for z in np.linspace(0.6, 0.12, 8)]
+        pts = [p + V3(0, -0.04 * (0.6 - p[2] + O[2]) / 0.5, 0) for p in pts]
+        rr = np.interp(np.linspace(0, 1, 8), [0, 0.12, 0.25, 0.6, 1], [0.088, 0.085, 0.07, 0.06, 0.05])
+        add_loft(acc, pts, rr, rr * 1.05, (1, 0, 0), sides=14, col=BOOT, rough=0.45, caps=(True, False))
+        add_loft(acc, [L(s * 0.112, 0.04, z) for z in (0.6, 0.52)], [0.093, 0.09], [0.1, 0.097], (1, 0, 0),
+                 sides=14, col=BOOT * 1.3, rough=0.5)
+        fp = [L(s * 0.122, y, 0.0) for y in np.linspace(-0.08, 0.2, 8)]
+        hw = np.interp(np.linspace(0, 1, 8), [0, 0.2, 0.6, 0.85, 1], [0.04, 0.05, 0.05, 0.04, 0.02])
+        hh = np.interp(np.linspace(0, 1, 8), [0, 0.25, 0.5, 0.85, 1], [0.07, 0.07, 0.05, 0.04, 0.02])
+        fp = [p + V3(0, 0, h_) for p, h_ in zip(fp, hh)]
+        add_loft(acc, fp, hw, hh, (1, 0, 0), sides=14, col=BOOT, rough=0.45, caps=(True, True))
+    add_ellipsoid(acc, L(0, -0.005, 0.93), (0.165, 0.115, 0.1), col=TROUSER, rough=0.85)
+    # ---- torso (coat), shirt V, belt, buttons
+    zz = np.linspace(0.93, 1.47, 10)
+    tx = np.interp(zz, [0.93, 1.0, 1.12, 1.27, 1.4, 1.47], [0.165, 0.152, 0.16, 0.18, 0.19, 0.15])
+    ty = np.interp(zz, [0.93, 1.0, 1.12, 1.27, 1.4, 1.47], [0.118, 0.11, 0.12, 0.13, 0.115, 0.085])
+    tc = [L(0, 0.012 * (z - 0.93), z) for z in zz]
+    add_loft(acc, tc, tx, ty, (1, 0, 0), sides=22, col=COAT, rough=0.85, caps=(False, True))
+    gam = np.radians(np.interp(zz, [0.93, 1.02, 1.47], [3, 6, 34]))
+    sel = zz > 1.0
+    add_loft(acc, np.array(tc)[sel], tx[sel] + 0.007, ty[sel] + 0.007, (1, 0, 0), sides=8, col=SHIRT, rough=0.9,
+             a0=np.pi / 2 - gam[sel], a1=np.pi / 2 + gam[sel])
+    for sgn in (1, -1):
+        edge = [np.array(tc)[i] + V3(sgn * math.cos(np.pi / 2 - gam[i]) * (tx[i] + 0.012), math.sin(np.pi / 2 - gam[i]) * (ty[i] + 0.012), 0)
+                for i in range(len(zz)) if zz[i] > 1.02]
+        add_tube(acc, edge, 0.012, sides=6, col=COAT * 1.25, mat=M_PAINT, rough=0.8)
+        for e in edge[1::2]:
+            add_ellipsoid(acc, e + V3(sgn * 0.022, 0.006, 0), (0.012, 0.008, 0.012), col=GOLD, mat=M_GOLD, nu=8, nv=6)
+    add_loft(acc, [L(0, 0.0, 0.955), L(0, 0.0, 1.02)], [0.172, 0.165], [0.127, 0.12], (1, 0, 0), sides=22,
+             col=BELT, rough=0.55)
+    add_box(acc, L(0, 0.13, 0.988), np.eye(3), (0.05, 0.012, 0.04), col=GOLD, mat=M_GOLD)
+    add_box(acc, L(0, 0.137, 0.988), np.eye(3), (0.028, 0.008, 0.02), col=BELT, mat=M_PAINT)
+    # sash/baldric across the chest
+    bal = [L(0.16 * math.cos(t), 0.125 * math.sin(t) + 0.004, 1.0 + 0.42 * (t - 0.35) / 2.6) for t in np.linspace(0.35, 2.95, 10)]
+    add_tube(acc, bal, 0.022, sides=6, col=BELT * 1.2, mat=M_PAINT, rough=0.55)
+    # ---- coat skirt (open at the front, lined)
+    zz = np.linspace(0.97, 0.38, 9)
+    sx = np.interp(zz, [0.38, 0.6, 0.97], [0.29, 0.24, 0.17])
+    sy = np.interp(zz, [0.38, 0.6, 0.97], [0.23, 0.19, 0.125])
+    gam = np.radians(np.interp(zz, [0.38, 0.7, 0.97], [42, 30, 12]))
+    sc = [L(0, -0.03 * (0.97 - z), z) for z in zz]
+    add_loft(acc, sc, sx, sy, (1, 0, 0), sides=26, col=COAT, rough=0.85, a0=np.pi / 2 + gam,
+             a1=np.pi / 2 + 2 * np.pi - gam, double=COAT_IN, inset=0.01)
+    hem = [sc[-1] + V3(sx[-1] * math.cos(a), sy[-1] * math.sin(a), 0)
+           for a in np.linspace(np.pi / 2 + gam[-1], np.pi / 2 + 2 * np.pi - gam[-1], 30)]
+    add_tube(acc, hem, 0.012, sides=5, col=GOLD_D, mat=M_GOLD)
+    # ---- neck, cravat, head
+    add_loft(acc, [L(0, 0.01, z) for z in (1.43, 1.5, 1.58)], [0.052, 0.05, 0.05], [0.055, 0.052, 0.05], (1, 0, 0),
+             sides=14, col=SKIN, rough=0.6)
+    add_ellipsoid(acc, L(0, 0.065, 1.465), (0.055, 0.035, 0.04), col=SHIRT, rough=0.9, nu=12, nv=8)
+    H = L(0, 0.012, 1.665)
+    add_ellipsoid(acc, H, (0.084, 0.097, 0.115), col=SKIN, rough=0.6, nu=24, nv=16)
+    add_ellipsoid(acc, H + V3(0, 0.088, -0.008), (0.018, 0.03, 0.032),
+                  axes=frame_axes((1, 0, 0), (0, 0.35, 1)), col=SKIN_D, rough=0.6, nu=10, nv=8)
+    for s in (1, -1):
+        add_ellipsoid(acc, H + V3(s * 0.078, -0.01, 0.0), (0.012, 0.022, 0.032), col=SKIN_D, rough=0.6, nu=8, nv=6)
+        add_tube(acc, [H + V3(s * 0.013, 0.09, 0.047), H + V3(s * 0.035, 0.087, 0.052), H + V3(s * 0.058, 0.074, 0.046)],
+                 0.009, sides=5, col=BEARD, mat=M_ROPE, rough=0.95)
+    add_ellipsoid(acc, H + V3(0.033, 0.079, 0.025), (0.012, 0.01, 0.009), col=hexc("#0e0b09"), rough=0.3, nu=8, nv=6)
+    pa = frame_axes((0.94, 0.33, 0), (0, 0, 1))
+    add_ellipsoid(acc, H + V3(-0.034, 0.086, 0.024), (0.027, 0.009, 0.022), axes=pa, col=hexc("#0b0908"), rough=0.5,
+                  nu=10, nv=6)
+    phi = np.linspace(-np.pi, np.pi, 33)
+    sz = 0.03 + 0.03 * np.sin(phi + 0.0)
+    strap = []
+    for f_, z_ in zip(phi, sz):
+        zz_ = z_
+        k = math.sqrt(max(1 - (zz_ / 0.112) ** 2, 0))
+        strap.append(H + V3(-0.083 * k * math.sin(f_), 0.098 * k * math.cos(f_), zz_))
+    add_tube(acc, strap, 0.005, sides=4, col=hexc("#0b0908"), mat=M_PAINT, rough=0.5)
+    # ---- hair, beard, moustache, braids
+    add_ellipsoid(acc, H + V3(0, -0.05, -0.07), (0.088, 0.07, 0.13), col=HAIRC, mat=M_ROPE, rough=0.95, bump=0.08,
+                  bump_freq=9, seed=3)
+    add_ellipsoid(acc, H + V3(0, 0.045, -0.118), (0.097, 0.074, 0.088), col=BEARD, mat=M_ROPE, rough=0.95,
+                  bump=0.1, bump_freq=8, seed=5, nu=26, nv=16)
+    add_ellipsoid(acc, H + V3(0, 0.068, -0.215), (0.09, 0.06, 0.12), col=BEARD, mat=M_ROPE, rough=0.95,
+                  bump=0.14, bump_freq=7, seed=6, nu=24, nv=16)
+    for s in (1, -1):
+        add_ellipsoid(acc, H + V3(s * 0.072, 0.01, -0.075), (0.028, 0.048, 0.055), col=BEARD, mat=M_ROPE, rough=0.95,
+                      bump=0.1, bump_freq=9, seed=7 + s)
+    must = [H + V3(-0.07, 0.085, -0.075), H + V3(-0.035, 0.112, -0.03), H + V3(0, 0.122, -0.022),
+            H + V3(0.035, 0.112, -0.03), H + V3(0.07, 0.085, -0.075)]
+    add_tube(acc, must, [0.01, 0.017, 0.016, 0.017, 0.01], sides=8, col=BEARD, mat=M_ROPE, rough=0.95)
+    for s in (1, -1):
+        bt = np.linspace(0, 1, 14)
+        bp = [H + V3(s * (0.035 - 0.01 * t), 0.115 + 0.01 * t, -0.27 - 0.17 * t) for t in bt]
+        br = 0.017 * (1 - 0.4 * bt) * (1 + 0.25 * np.abs(np.sin(bt * 22)))
+        add_tube(acc, bp, br, sides=8, col=BEARD, mat=M_ROPE, rough=0.95, caps=(False, True))
+        e = bp[-2]
+        add_tube(acc, [e + V3(0, 0, 0.02), e + V3(0, 0, -0.01)], 0.016, sides=8, caps=(True, True), col=GOLD,
+                 mat=M_GOLD)
+    # ---- tricorn hat
+    hc = H + V3(0, -0.006, 0.075)
+    add_ellipsoid(acc, hc, (0.096, 0.108, 0.085), col=HATC, rough=0.9, zcut=-0.15, nu=24, nv=10)
+    nphi = 72
+    phs = np.linspace(0, 2 * np.pi, nphi + 1)
+    Rc = 0.29
+    corners = np.radians([90, 210, 330])
+    rows = 7
+    G = np.zeros((nphi + 1, rows, 3))
+    top = []
+    for i, f_ in enumerate(phs):
+        rel = ((f_ - corners[0]) % (2 * np.pi / 3)) - np.pi / 3
+        rtri = Rc * 0.5 / max(math.cos(rel), 0.5)
+        cornerness = math.cos(rel * 3) * 0.5 + 0.5      # 1 at corners
+        rtri = rtri * (1 - 0.08 * cornerness ** 8)
+        hup = 0.035 + 0.075 * (1 - cornerness) ** 0.7
+        rin_x, rin_y = 0.1, 0.112
+        for j, t in enumerate(np.linspace(0, 1, rows)):
+            px = lerp(rin_x * math.cos(f_), rtri * math.cos(f_), t)
+            py = lerp(rin_y * math.sin(f_), rtri * math.sin(f_), t)
+            G[i, j] = hc + V3(px, py, -0.065 + hup * t ** 1.8)
+        top.append(G[i, -1])
+    T = grid_tris(nphi + 1, rows)
+    Pf = G.reshape(-1, 3)
+    fn = face_normals(Pf, T)
+    if fn.sum(0)[2] < 0:
+        T = T[:, ::-1]
+    Nn = vertex_normals(Pf, T)
+    acc.add(Pf + Nn * 0.004, T, N=Nn, col=HATC, mat=M_PAINT, rough=0.9)
+    acc.add(Pf - Nn * 0.004, T[:, ::-1], N=-Nn, col=HATC, mat=M_PAINT, rough=0.9)
+    add_tube(acc, np.array(top), 0.009, sides=5, col=GOLD, mat=M_GOLD)
+    # ---- arms reaching the handles
+    info["eye"] = H + V3(0, 0.088, 0.025)
+    for s in (1, -1):
+        part0 = len(acc.parts)
+        a = s * GRIP_A
+        rdir = V3(math.sin(a), 0, math.cos(a))
+        hd = wc + rdir * GRIP_R
+        palm = hd + V3(0, -0.045, 0) + rdir * 0.0
+        S = L(s * 0.185, 0.0, 1.415)
+        Wr = palm - nrm(palm - S) * 0.075
+        E, Wr2 = solve_elbow(S, Wr, 0.3, 0.28, V3(s * 0.3, -0.55, -0.8))
+        if np.linalg.norm(Wr2 - Wr) > 0.02:
+            log("WARN arm cannot reach: short by %.3f" % np.linalg.norm(Wr2 - Wr))
+        add_ellipsoid(acc, S + V3(0, 0, 0.005), (0.078, 0.078, 0.072), col=COAT, rough=0.85, nu=16, nv=10)
+        up = [S + (E - S) * t for t in np.linspace(0, 1, 6)]
+        lo = [E + (Wr - E) * t for t in np.linspace(0, 1, 6)][1:]
+        pts = np.array(up + lo)
+        rr = np.concatenate([np.linspace(0.066, 0.054, 6), np.linspace(0.052, 0.045, 5)])
+        add_tube(acc, pts, rr, sides=14, col=COAT, mat=M_PAINT, rough=0.85)
+        add_ellipsoid(acc, E, (0.055, 0.055, 0.055), col=COAT, rough=0.85, nu=12, nv=8)
+        fu = nrm(Wr - E)
+        add_tube(acc, [Wr - fu * 0.14, Wr - fu * 0.12, Wr - fu * 0.025, Wr - fu * 0.01], [0.05, 0.07, 0.07, 0.05],
+                 sides=14, col=COAT * 1.15, mat=M_PAINT, rough=0.8)
+        for k in (0.05, 0.09):
+            ob = nrm(np.cross(fu, V3(0, 0, 1))) * s
+            add_ellipsoid(acc, Wr - fu * k + ob * 0.071, (0.011, 0.011, 0.011), col=GOLD, mat=M_GOLD, nu=8, nv=6)
+        add_tube(acc, [Wr - fu * 0.015, Wr + fu * 0.012], [0.05, 0.056], sides=12, col=SHIRT, mat=M_PAINT,
+                 rough=0.9, caps=(False, True))
+        add_tube(acc, [Wr, palm], [0.033, 0.04], sides=12, col=SKIN, mat=M_PAINT, rough=0.6)
+        hax = frame_axes(palm - Wr, rdir)
+        add_ellipsoid(acc, palm, (0.048, 0.03, 0.045), axes=hax, col=SKIN, rough=0.6, nu=12, nv=8)
+        # curled fingers around the handle
+        e1 = V3(0, -1, 0)
+        e2 = nrm(np.cross(rdir, e1))
+        fing = [hd + 0.038 * (math.cos(t) * e1 + math.sin(t) * e2) for t in np.linspace(-0.6 * s, 0.6 * s + 4.2 * s, 12)]
+        for off in (-0.022, 0.0, 0.022):
+            add_tube(acc, [f + rdir * off for f in fing], 0.0145, sides=8, col=SKIN, mat=M_PAINT, rough=0.6,
+                     caps=(True, True))
+        th = [palm + rdir * 0.035, hd + rdir * 0.04 + V3(0, -0.01, 0) + e2 * 0.025 * s]
+        add_tube(acc, th, 0.016, sides=8, col=SKIN, mat=M_PAINT, rough=0.6, caps=(True, True))
+        arm_follow_weights(acc, part0, [S, E, Wr, palm, hd])
+    acc.cur_w = 0
+
+
+# ----------------------------------------------------------------------------
+# weathering pass on the final vertex colours
+# ----------------------------------------------------------------------------
+ALGAE = hexc("#3b4524")
+ALGAE_B = hexc("#4a3f25")
+SALT = hexc("#8e897d")
+RUST = hexc("#5a2e17")
+TARS = hexc("#231c15")
+
+
+def weather(P, N, C, M, info):
+    C = C.copy()
+    x, y, z = P[:, 0], P[:, 1], P[:, 2]
+    ax_ = np.abs(x)
+    hbv = hb(y, z)
+    inlen = (y > y_post(z) - 0.8) & (y < y_stem(z) + 2.2)
+    hullish = np.isin(M, [M_HULL, M_PAINT, M_COPPER, M_GOLD]) & inlen
+    skip = np.zeros(len(P), bool)
+    if "pirate_pivot" in info:
+        skip = np.linalg.norm(P - info["pirate_pivot"] - V3(0, 0, 1), axis=1) < 1.4
+    outer = hullish & (ax_ >= hbv - 0.08) & (np.abs(N[:, 0]) > 0.2) & (z < z_top(y) + 0.25) & ~skip
+    transom = hullish & (y < y_post(z) + 0.12) & (np.abs(N[:, 1]) > 0.5) & ~skip
+    ext = outer | transom
+    p3 = np.stack([x * 0.0 + ax_, y, z], 1)
+    # general grime and darker weathered planks on the outer hull
+    g = fbm(p3 * 0.8, 4, seed=21)
+    C[ext] *= (0.78 + 0.32 * g[ext])[:, None]
+    wood = ext & (M == M_HULL)
+    plank = np.floor((z + 3.5) / 0.25).astype(np.int64)
+    seg = np.floor((y + 6 * hash1(plank, seed=3)) / 5.0).astype(np.int64)
+    f = hash1(plank, seg, seed=4)
+    C[wood] *= (0.8 + 0.32 * f[wood])[:, None]
+    # grime / rust streaks below gunports, scuppers and chainplates
+    src = []
+    rng = np.random.default_rng(77)
+    for yp, dh, sc in PORTS:
+        src.append((yp, float(deck_main(yp)) + (dh or 0) + 0.4 * sc, rng.uniform(0.12, 0.2), rng.uniform(1.6, 2.6), 0))
+        src.append((yp + rng.uniform(-0.25, 0.25), float(deck_main(yp)) + (dh or 0) + 0.4 * sc,
+                    rng.uniform(0.06, 0.1), rng.uniform(0.8, 1.8), 1))
+    for ys_ in np.arange(-12.5, 12.0, 1.55):
+        ys2 = ys_ + rng.uniform(-0.3, 0.3)
+        src.append((ys2, float(deck_level(ys2)) + 0.02, rng.uniform(0.08, 0.16), rng.uniform(1.0, 2.2), 0))
+    for m, Mm in MASTS.items():
+        for k in range(Mm["nshroud"]):
+            yv = Mm["y"] + 0.35 - 0.62 * k
+            zc = float(deck_main(yv)) + (QD_H if m == "mizzen" else 0) + 0.15
+            src.append((yv, zc, 0.07, rng.uniform(0.8, 1.4), 1))
+    dark = np.zeros(len(P))
+    rust = np.zeros(len(P))
+    idx = np.nonzero(outer & (z > -0.3))[0]
+    yo, zo = y[idx], z[idx]
+    wob = 0.04 * np.sin(zo * 5.0 + yo)
+    for (ys_, zs_, w_, L_, kind) in src:
+        dz = zs_ - zo
+        s_ = np.exp(-((yo - ys_ + wob) / w_) ** 2) * np.where(dz > 0, np.exp(-dz / L_), 0) * (1 - np.exp(-dz / 0.05))
+        if kind:
+            rust[idx] = np.maximum(rust[idx], s_)
+        else:
+            dark[idx] = np.maximum(dark[idx], s_)
+    C *= (1 - 0.55 * dark)[:, None]
+    C += (RUST - C) * (0.55 * rust)[:, None]
+    # worn paint on the red strake (and other red paint)
+    red = (M == M_PAINT) & (C[:, 0] > 2.3 * C[:, 1] + 0.02) & ~skip
+    wm = smoothstep(0.5, 0.72, fbm(p3 * 2.4, 4, seed=5))
+    C[red] += ((HULL * 0.85 - C[red]) * (0.85 * wm[red])[:, None])
+    C[red] *= 0.85
+    # algae / weed band around the waterline (export y -0.4 .. +0.35)
+    nwl = fbm(np.stack([y * 0.9, ax_ * 0.5, np.zeros_like(y)], 1), 3, seed=8)
+    top = 0.35 + 0.12 * (nwl - 0.5) * 2
+    bot = -0.4 - 0.1 * (nwl - 0.5) * 2
+    wa = smoothstep(top + 0.06, top - 0.06, z) * smoothstep(bot - 0.08, bot + 0.06, z)
+    alg = (np.isin(M, [M_HULL, M_PAINT, M_COPPER]) & inlen & ~skip) & ((ax_ >= hbv - 0.12) | transom | (ax_ < 0.4))
+    tone = fbm(p3 * 3.0, 3, seed=9)
+    acol = ALGAE[None, :] * (1 - tone[:, None]) + ALGAE_B[None, :] * tone[:, None]
+    k = (wa * (0.55 + 0.4 * tone))[alg]
+    C[alg] += (acol[alg] - C[alg]) * k[:, None]
+    # salt crust near the upper edges and on upward-facing outer ledges
+    sh = smoothstep(z_top(y) - 0.4, z_top(y) + 0.05, z)
+    ledge = (N[:, 2] > 0.55) & (ax_ >= hbv - 0.35)
+    sm = np.isin(M, [M_HULL, M_PAINT]) & inlen & ~skip & (outer | ledge | transom)
+    sk = (np.maximum(sh * 0.7, ledge * 0.55) * (0.35 + 0.65 * fbm(p3 * 3.5, 3, seed=13)))[sm]
+    C[sm] += (SALT - C[sm]) * (0.6 * sk)[:, None]
+    # deck: plank tone variation and tar stains
+    dk = (M == M_DECK) & (N[:, 2] > 0.7) & ~skip
+    pl = np.floor(x / 0.25).astype(np.int64)
+    sg = np.floor((y + 5 * hash1(pl, seed=31)) / 6.0).astype(np.int64)
+    fv = hash1(pl, sg, seed=32)
+    C[dk] *= (0.68 + 0.3 * fv[dk])[:, None]
+    ts = smoothstep(0.53, 0.63, fbm(np.stack([x * 0.9, y * 0.9, z * 0.0], 1), 4, seed=33))
+    C[dk] += (TARS - C[dk]) * (0.8 * ts[dk])[:, None]
+    return np.clip(C, 0, 1)
+
+
+# ----------------------------------------------------------------------------
 # hydrostatics + reporting
 # ----------------------------------------------------------------------------
 def hydrostatics():
@@ -1843,7 +2376,7 @@ def compute_ao(P, N, T, M, K=48, D=4.0):
                 occ += 1.0 - 0.25 * (hit[3] / D)
         ao[v] = 1.0 - occ / k
     log("AO: %d verts in %.1fs" % (len(P), time.time() - t0))
-    ao = np.clip(ao, 0, 1) ** 1.4
+    ao = np.clip(ao, 0, 1) ** 1.8
     ao[M == M_GLASS] = 1.0
     ao[rope_mask] = np.maximum(ao[rope_mask], 0.75)
     return ao
@@ -1852,7 +2385,11 @@ def compute_ao(P, N, T, M, K=48, D=4.0):
 # ----------------------------------------------------------------------------
 # export
 # ----------------------------------------------------------------------------
-def export_bin(path, P, N, UV, C, AO, M, R, E, T):
+HEADER_EXTRA = [0.0, 0.0, 0.0, 0.0]   # eye x, y, z (export space), neck-bottom height above the foot pivot
+NECK_BOTTOM = 1.43                     # local height (m) above the helmsman's foot pivot
+
+
+def export_bin(path, P, N, UV, C, AO, M, R, E, W, T):
     n = len(P)
     Pe = np.stack([P[:, 0], P[:, 2], -P[:, 1]], 1).astype("<f4")
     Ne = np.stack([N[:, 0], N[:, 2], -N[:, 1]], 1)
@@ -1868,9 +2405,11 @@ def export_bin(path, P, N, UV, C, AO, M, R, E, T):
     Vb["mat"][:, 0] = M.astype(np.uint8)
     Vb["mat"][:, 1] = np.clip(np.round(R * 255), 0, 255).astype(np.uint8)
     Vb["mat"][:, 2] = np.clip(np.round(E), 0, 255).astype(np.uint8)
+    Vb["mat"][:, 3] = np.clip(np.round(W), 0, 255).astype(np.uint8)
     bmin = Pe.min(0)
     bmax = Pe.max(0)
-    hdr = b"SHP1" + struct.pack("<III", n, T.size, 0) + struct.pack("<6f", *bmin, *bmax) + struct.pack("<6f", *([0.0] * 6))
+    hdr = b"SHP1" + struct.pack("<III", n, T.size, 0) + struct.pack("<6f", *bmin, *bmax) \
+        + struct.pack("<4f", *HEADER_EXTRA) + struct.pack("<2f", 0.0, 0.0)
     assert len(hdr) == 64
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "wb") as f:
@@ -1888,7 +2427,7 @@ def srgb_to_lin(c):
     return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
 
 
-def make_mesh_object(P, N, UV, C, AO, M, R, E, T):
+def make_mesh_object(P, N, UV, C, AO, M, R, E, W, T):
     me = bpy.data.meshes.new("ShipMesh")
     n, m = len(P), len(T)
     me.vertices.add(n)
@@ -1905,7 +2444,7 @@ def make_mesh_object(P, N, UV, C, AO, M, R, E, T):
     emit = np.where(M == M_GLASS, E / 255.0, 0.0)
     transl = np.select([M == M_SAIL, M == M_FLAG], [0.3, 0.12], 0.0)
     for name, arr in (("ao", AO), ("rough", R), ("metal", metal), ("emit", emit), ("transl", transl),
-                      ("matid", M.astype(float)), ("extra", E / 255.0)):
+                      ("matid", M.astype(float)), ("extra", E / 255.0), ("wflag", W)):
         at = me.attributes.new(name, "FLOAT", "POINT")
         at.data.foreach_set("value", arr.astype(np.float32))
     uvl = me.uv_layers.new(name="UVMap")
@@ -2107,6 +2646,27 @@ def ao_render(tag):
     sc.view_settings.view_transform = look
 
 
+def albedo_render(tag, views):
+    sc = bpy.context.scene
+    eng = sc.render.engine
+    me = bpy.data.objects["PirateShip"].data
+    try:
+        me.color_attributes.active_color = me.color_attributes["albedo"]
+    except Exception as ex:
+        log("albedo attr", ex)
+    sc.render.engine = "BLENDER_WORKBENCH"
+    sc.display.shading.light = "FLAT"
+    sc.display.shading.color_type = "VERTEX"
+    vt = sc.view_settings.view_transform
+    sc.view_settings.view_transform = "Standard"
+    for v in views:
+        sc.camera = bpy.data.objects["Cam_" + v]
+        sc.render.filepath = os.path.join(RENDER_DIR, "%s_albedo_%s.png" % (tag, v))
+        bpy.ops.render.render(write_still=True)
+    sc.view_settings.view_transform = vt
+    sc.render.engine = eng
+
+
 def check_render(tag):
     sc = bpy.context.scene
     eng = sc.render.engine
@@ -2138,13 +2698,16 @@ def main():
     build_stern(acc, info)
     build_bowsprit(acc, info)
     build_furniture(acc, info)
+    build_helm(acc, info)
+    build_pirate(acc, info)
     build_masts(acc, info)
     build_yards(acc)
     build_rigging(acc, info)
     build_sails(acc, info)
     build_sheets(acc, info)
     build_flag(acc, info)
-    P, N, UV, C, M, R, E, T = acc.arrays()
+    P, N, UV, C, M, R, E, W, T = acc.arrays()
+    C = weather(P, N, C, M, info)
     # drop degenerate triangles
     area = np.linalg.norm(face_normals(P, T), axis=1)
     T = T[area > 1e-10]
@@ -2157,12 +2720,18 @@ def main():
     P = P.copy()
     P[:, 1] += shift
     AO = np.ones(len(P)) if FAST else compute_ao(P, N, T, M)
-    bmin, bmax = export_bin(BIN_PATH, P, N, UV, C, AO, M, R, E, T)
+    eye = info["eye"] + V3(0, shift, 0)
+    HEADER_EXTRA[:] = [float(eye[0]), float(eye[2]), float(-eye[1]), NECK_BOTTOM]
+    bmin, bmax = export_bin(BIN_PATH, P, N, UV, C, AO, M, R, E, W, T)
     log("wrote", BIN_PATH, os.path.getsize(BIN_PATH), "bytes")
     report(info, hs, shift, bmin, bmax, len(P), len(T))
     # preview scene
-    make_mesh_object(P, N, UV, C, AO, M, R, E, T)
+    make_mesh_object(P, N, UV, C, AO, M, R, E, W, T)
     setup_scene(info)
+    P0 = info["pirate_pivot"] + V3(0, shift, 0)
+    VIEW_DEFS["helm"] = (tuple(P0 + V3(1.3, 3.6, 1.6)), tuple(P0 + V3(0, 0.1, 1.3)), 40)
+    VIEW_DEFS["helm2"] = (tuple(P0 + V3(-2.7, 2.4, 1.7)), tuple(P0 + V3(0, 0.15, 1.25)), 40)
+    VIEW_DEFS["helm3"] = (tuple(P0 + V3(1.5, -2.3, 2.1)), tuple(P0 + V3(0, 0.4, 1.25)), 40)
     for v, (loc, tgt, lens) in VIEW_DEFS.items():
         add_camera("Cam_" + v, loc, tgt, lens)
     bpy.ops.wm.save_as_mainfile(filepath=BLEND_PATH, compress=True)
@@ -2170,6 +2739,8 @@ def main():
     if RENDER_TAG:
         if CHECK:
             check_render(RENDER_TAG)
+        if opt("--albedo", False):
+            albedo_render(RENDER_TAG, ("side", "sternq", "deck", "bow"))
         if opt("--aoview", False):
             ao_render(RENDER_TAG)
         render_views(RENDER_TAG)
@@ -2199,6 +2770,12 @@ def report(info, hs, shift, bmin, bmax, nv, nt):
         t = info["trucks"][m]
         print("mast %-6s truck: (%.2f, %.2f, %.2f)" % ((m,) + ex(t)))
     print("main flag: top of hoist at y=%.2f" % (info["trucks"]["main"][2] - 0.15))
+    wc = info["wheel_centre"]
+    print("wheel pivot (axle centre): (%.3f, %.3f, %.3f)   axis: (0, 0, -1) (export -Z = toward the bow)" % ex(wc))
+    print("helmsman foot pivot: (%.3f, %.3f, %.3f)" % ex(info["pirate_pivot"]))
+    print("helmsman eye (between the eyes): (%.3f, %.3f, %.3f)" % ex(info["eye"]))
+    print("helmsman neck bottom: local y %.3f above foot pivot (export y %.3f)"
+          % (NECK_BOTTOM, info["pirate_pivot"][2] + NECK_BOTTOM))
     for i, L in enumerate(info["lanterns"]):
         print("stern lantern %d glass centre: (%.2f, %.2f, %.2f)" % ((i,) + ex(L)))
     print("=============================================================================\n", flush=True)

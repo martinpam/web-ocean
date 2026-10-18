@@ -1,6 +1,6 @@
 // Pirate ship: lit mesh, sun shadow map, and the multi-point water height probe that
 // drives its buoyancy.
-import { FRAME_WGSL, ATMO_CORE_WGSL, ENV_MIPS, CASCADES } from './common.js';
+import { FRAME_WGSL, ATMO_CORE_WGSL, ENV_MIPS, CASCADES, NOISE_WGSL } from './common.js';
 import { SKY_RENDER_FUNCS } from './sky.js';
 
 export const SHIP_PROBES = 16;
@@ -17,7 +17,10 @@ struct Ship {
   p1:       vec4f,     // ship world x, z, forward x, z
   p2:       vec4f,     // speed (m/s), hull half length, hull half beam, hull centre z (local)
   lant:     array<vec4f, ${MAX_LANTERNS}>,  // camera-relative lantern position, w = intensity
-  p3:       vec4f,     // reflection plane height relative to the camera, sail set (0..1), -, -
+  p3:       vec4f,     // reflection plane height relative to the camera, sail set (0..1), hide head, neck height (local y)
+  wheel:    vec4f,     // wheel axle centre (local xyz), wheel angle (rad)
+  crew:     vec4f,     // helmsman foot pivot (local xyz), counter-roll (rad)
+  wind:     vec4f,     // helmsman counter-pitch (rad), sail fill (0 = luffing .. 1 = full), gust, -
 };
 `;
 
@@ -78,31 +81,93 @@ struct VI {
 const MAT_SAIL: u32 = 2u;
 const MAT_FLAG: u32 = 8u;
 fn matId(m: vec4f) -> u32 { return u32(m.x * 255.0 + 0.5); }
-// cloth motion: slow breathing of the sails, fast waving of the flag (local space)
-fn flutter(v: VI) -> vec3f {
+const W_ROTATE: u32 = 255u;   // material.w: part of the turning wheel
+const W_CREW: u32 = 200u;     // material.w: the helmsman
+// direction the canvas bellies out to (downwind of the modelled sails)
+const BELLY_DIR: vec3f = vec3f(-0.33, 0.0, -0.94);
+
+fn rotX(p: vec3f, a: f32) -> vec3f { let c = cos(a); let s = sin(a); return vec3f(p.x, c * p.y - s * p.z, s * p.y + c * p.z); }
+fn rotZ(p: vec3f, a: f32) -> vec3f { let c = cos(a); let s = sin(a); return vec3f(c * p.x - s * p.y, s * p.x + c * p.y, p.z); }
+
+struct Posed { pos: vec3f, nrm: vec3f };
+
+// Local-space animation: wind in the sails, the flag, the turning wheel and the helmsman.
+fn pose(v: VI) -> Posed {
   let id = matId(v.mat);
+  let tag = u32(v.mat.w * 255.0 + 0.5);
   let k = v.mat.z;
   let t = S.p0.x;
+  var o: Posed;
+  o.pos = v.pos;
+  o.nrm = v.nrm.xyz;
   if (id == MAT_SAIL) {
-    let w = sin(t * 1.1 + v.uv.x * 0.35 + v.uv.y * 0.2) * 0.6 + sin(t * 2.3 - v.uv.y * 0.9) * 0.4;
+    // both sheets of a sail must move the same way: push along the downwind-facing normal
+    let n = v.nrm.xyz * select(1.0, -1.0, dot(v.nrm.xyz, BELLY_DIR) < 0.0);
+    let fill = S.wind.y;
+    let gust = S.wind.z;
+    // full sails: the modelled belly, swelling with the gusts and rippling a little
+    let ripple = sin(t * 3.1 + v.uv.x * 0.8 - v.uv.y * 0.5) * 0.04 + sin(t * 5.3 - v.uv.y * 1.7) * 0.02;
+    var d = (fill * (gust - 1.0) * 0.9 - (1.0 - fill) * 0.85) * k + ripple * k * fill;
+    // luffing: wind from ahead makes the slack canvas shake
+    let luff = (1.0 - fill) * (sin(t * 8.5 - v.uv.y * 1.3 + v.uv.x * 0.9) * 0.55 + sin(t * 13.0 + v.uv.x * 2.1) * 0.25);
+    d += luff * k * 0.45;
     // shortened sail: the canvas is gathered up towards its head (the yard)
     let furl = (1.0 - S.p3.y) * 0.85;
-    return v.nrm.xyz * (w * k * 0.09 * S.p0.y) + vec3f(0.0, v.uv.y * furl, 0.0);
+    o.pos += n * (d * S.p0.y) + vec3f(0.0, v.uv.y * furl, 0.0);
+    return o;
   }
   if (id == MAT_FLAG) {
-    let ph = t * 6.5 - v.uv.x * 2.2;
-    return vec3f(0.0, sin(ph * 0.7 + v.uv.y) * 0.08, 0.0) * k + v.nrm.xyz * (sin(ph) * 0.22 * k);
+    let ph = t * (5.0 + 3.0 * S.wind.z) - v.uv.x * 2.2;
+    o.pos += vec3f(0.0, sin(ph * 0.7 + v.uv.y) * 0.08, 0.0) * k + v.nrm.xyz * (sin(ph) * 0.22 * k);
+    return o;
   }
-  return vec3f(0.0);
+  if (tag == W_ROTATE) {
+    o.pos = S.wheel.xyz + rotZ(v.pos - S.wheel.xyz, S.wheel.w);
+    o.nrm = rotZ(v.nrm.xyz, S.wheel.w);
+    return o;
+  }
+  if (tag == W_CREW) {
+    // arms: turn with the wheel about its axle (material.z = how much a vertex follows),
+    // up to about 50 degrees, as a helmsman moves his hands before he re-grips
+    let ga = clamp(S.wheel.w, -0.87, 0.87) * k;
+    let ap = S.wheel.xyz + rotZ(v.pos - S.wheel.xyz, ga);
+    let an = rotZ(v.nrm.xyz, ga);
+    // body: stands upright against the roll and pitch of the deck, and breathes;
+    // the hands stay on the wheel
+    let q = ap - S.crew.xyz;
+    let breathe = 1.0 + 0.012 * sin(t * 1.7) * smoothstep(1.0, 1.4, q.y) * (1.0 - smoothstep(1.4, 1.6, q.y));
+    let a = (S.crew.w + 0.03 * sin(t * 0.9)) * (1.0 - k);
+    let b = S.wind.x * (1.0 - k);
+    o.pos = S.crew.xyz + rotX(rotZ(q * vec3f(breathe, 1.0, breathe), a), b);
+    o.nrm = rotX(rotZ(an, a), b);
+    return o;
+  }
+  return o;
+}
+
+// Round holes and tears in the canvas (same pattern on both sheets: it depends on the
+// local position only).
+fn canvasHole(lp: vec3f) -> bool {
+  let q = vec2f(lp.x * 0.8 + lp.z * 1.1, lp.y * 0.95);
+  let n = gnoise(q * 0.55) * 0.7 + gnoise(q * 1.9 + 7.3) * 0.3 + gnoise(q * 6.0 + 1.7) * 0.12;
+  return n > 0.36;
 }
 `;
 
-export const SHIP_SHADOW = FRAME_WGSL + SHIP_WGSL + /* wgsl */ `
+export const SHIP_SHADOW = FRAME_WGSL + SHIP_WGSL + NOISE_WGSL + /* wgsl */ `
 @group(0) @binding(0) var<uniform> S: Ship;
 ` + VERTEX_IN + /* wgsl */ `
-@vertex fn vs(v: VI) -> @builtin(position) vec4f {
-  let p = v.pos + flutter(v);
-  return S.shadowVP * (S.model * vec4f(p, 1.0));
+struct SO { @builtin(position) pos: vec4f, @location(0) lp: vec3f, @location(1) @interpolate(flat) mat: vec4f };
+@vertex fn vs(v: VI) -> SO {
+  var o: SO;
+  o.pos = S.shadowVP * (S.model * vec4f(pose(v).pos, 1.0));
+  o.lp = v.pos;
+  o.mat = v.mat;
+  return o;
+}
+// sunlight passes through the holes in the sails
+@fragment fn fs(in: SO) {
+  if (matId(in.mat) == MAT_SAIL && canvasHole(in.lp)) { discard; }
 }
 `;
 
@@ -117,17 +182,24 @@ struct VO {
   @location(3) col: vec4f,
   @location(4) @interpolate(flat) mat: vec4f,
   @location(5) ly: f32,          // local height above the design waterline
+  @location(6) lp: vec3f,        // rest position in ship space (hole pattern)
 };
 
-@vertex fn vs(v: VI) -> VO { return transform(v); }
+@vertex fn vs(v: VI) -> VO {
+  var o = transform(v);
+  // first-person view from the helmsman's eyes: leave out his head, hat and beard
+  if (S.p3.z > 0.5 && u32(v.mat.w * 255.0 + 0.5) == W_CREW && v.pos.y > S.p3.w) { o.pos = vec4f(0.0, 0.0, 0.0, 0.0); }
+  return o;
+}
 
 fn transform(v: VI) -> VO {
-  let p = v.pos + flutter(v);
+  let ps = pose(v);
   var o: VO;
-  let w = S.model * vec4f(p, 1.0);
+  let w = S.model * vec4f(ps.pos, 1.0);
   o.rel = w.xyz;
   o.pos = F.viewProj * w;
-  o.nrm = (S.model * vec4f(v.nrm.xyz, 0.0)).xyz;
+  o.nrm = (S.model * vec4f(ps.nrm, 0.0)).xyz;
+  o.lp = v.pos;
   o.uv = v.uv;
   o.col = v.col;
   o.mat = v.mat;
@@ -198,6 +270,7 @@ fn shade(in: VO, front: bool, V: vec3f, dist: f32) -> vec3f {
   var emis = vec3f(0.0);
   var trans = 0.0;
   var wet = 0.0;
+  var hole = false;
 
   if (id == 0u || id == 1u || id == 6u || id == 10u) {
     // planking: rows across v, butt joints along u, per-plank tint, grain, caulked seams
@@ -221,8 +294,9 @@ fn shade(in: VO, front: bool, V: vec3f, dist: f32) -> vec3f {
     let cloths = cellLine(uv.x / 0.62, 0.02, fu / 0.62) * 0.5;
     let weave = gnoise(uv * vec2f(160.0, 160.0)) * (1.0 - smoothstep(0.004, 0.02, fu));
     let stain = gnoise(uv * 0.35) * 0.5 + gnoise(uv * 1.3 + 5.0) * 0.25;
-    alb *= (1.0 - cloths * 0.25) * (0.92 + weave * 0.08) * (0.9 + stain * 0.25);
-    trans = select(0.55, 0.12, id == 8u);
+    alb *= (1.0 - cloths * 0.25) * (0.92 + weave * 0.08) * (0.9 + stain * 0.35);
+    trans = select(0.3, 0.12, id == 8u);
+    hole = id == 2u && canvasHole(in.lp);
   } else if (id == 3u) {
     let tw = sin((uv.x * 40.0 + uv.y * 25.0) * 6.2832);
     alb *= 0.85 + 0.15 * tw * (1.0 - smoothstep(0.05, 0.2, fu * 40.0));
@@ -240,6 +314,11 @@ fn shade(in: VO, front: bool, V: vec3f, dist: f32) -> vec3f {
     alb *= 0.9 + grain * 0.25;
   }
 
+  // weather: rain and spray streaks run down the timber
+  if (id == 0u || id == 6u || id == 9u || id == 1u) {
+    let streak = gnoise(vec2f((in.lp.x + in.lp.z) * 2.2, in.lp.y * 0.22)) + 0.4 * gnoise(vec2f((in.lp.x - in.lp.z) * 7.0, in.lp.y * 0.9));
+    alb *= 1.0 - 0.32 * smoothstep(0.05, 0.55, streak);
+  }
   // the hull is dark and glossy where the sea washes over it
   wet = 1.0 - smoothstep(0.2, 1.4, in.ly);
   alb *= mix(1.0, 0.55, wet);
@@ -293,6 +372,7 @@ fn shade(in: VO, front: bool, V: vec3f, dist: f32) -> vec3f {
   let T = exp(-max(F.fogExt.rgb, vec3f(F.fogExt.w)) * dist);
   let hz = normalize(vec3f(-V.x, max(-V.y, 0.002), -V.z));
   col = col * T + skyAtmo(hz) * (1.0 - T);
+  if (hole) { discard; }
   return col;
 }
 `;

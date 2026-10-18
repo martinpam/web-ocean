@@ -20,10 +20,10 @@ const TU = GPUTextureUsage;
 // ----------------------------------------------------------------------------------------
 export const P = {
   windSpeed: 7.0,      // m/s at 10 m
-  windDir: 118,        // deg, direction waves travel (90 = towards +Z, i.e. towards the viewer)
+  windDir: 235,        // deg, direction waves travel (90 = towards +Z); 235 = fair wind towards the sun
   fetchKm: 90,
   swellHs: 1.8,        // m significant height
-  swellDir: 94,
+  swellDir: 215,
   swellLength: 120,    // m peak wavelength
   swellSpread: 48,     // cos^2s exponent
   choppy: 1.25,
@@ -290,6 +290,7 @@ async function main() {
     shader, computePipe, HDR, MSAA, frameUBO, transView, skyView, sampClamp, envCubeView, sunVisBuf,
     dispView: fullArr(dispTex), samplerSim,
   });
+  if (qs.has('debug')) window.ship = ship;  // console access for tuning
   const bgFoamUpd = [0, 1].map((i) => bg(foamUpdPipe, [{ buffer: foamUBO }, lvl(foamW[1 - i], 0), lvl(foamW[i], 0),
     fullArr(dispTex), fullArr(derivTex), samplerSim, samplerSim, { buffer: ship.hullBuf }], 'foamupd' + i));
   // rebuilt on resize, because the ship reflection target follows the screen size
@@ -360,11 +361,15 @@ async function main() {
   };
   let downPasses = [], upPasses = [], downBGs = [], upBGs = [], bgComp = null;
 
+  // Render scale: fraction of the native (device pixel) resolution. It adapts to keep the
+  // frame rate up (see adaptScale); ?scale= fixes it. The browser stretches the canvas.
+  const fixedScale = Number(qs.get('scale')) || 0;
+  let renderScale = fixedScale || Math.min(1, 1.5 / (window.devicePixelRatio || 1));
   function resize() {
     const fw = Number(qs.get('w')) || 0, fh = Number(qs.get('h')) || 0;
-    const dpr = window.devicePixelRatio || 1;
-    const w = fw || Math.max(1, Math.round(canvas.clientWidth * dpr));
-    const h = fh || Math.max(1, Math.round(canvas.clientHeight * dpr));
+    const k = (window.devicePixelRatio || 1) * renderScale;
+    const w = fw || Math.max(1, Math.round(canvas.clientWidth * k));
+    const h = fh || Math.max(1, Math.round(canvas.clientHeight * k));
     if (w === W && h === H) return;
     W = w; H = h;
     canvas.width = W; canvas.height = H;
@@ -454,7 +459,11 @@ async function main() {
   // --------------------------------------------------------------------------------------
   const cam = { x: 0, y: 2.4, z: 0, yaw: 0, pitch: -5.5 * D2R, fovY: 58 * D2R, speed: 6 };
   // ship camera: orbits the ship; yaw is relative to the ship's heading so it turns with it
-  const orbit = { yaw: 75 * D2R, pitch: -6 * D2R, dist: 72, freeCam: false };
+  const orbit = { yaw: -16 * D2R, pitch: -7 * D2R, dist: 70, freeCam: false, view: 0 };
+  // V cycles the ship views: 0 = chase (orbit), 1 = behind the helmsman, 2 = his eyes
+  const VIEWS = ['chase', 'helm', 'eyes'];
+  const viewLook = { yaw: 0, pitch: 0 };
+  if (qs.has('view')) orbit.view = Number(qs.get('view')) || 0;
   if (qs.get('orbit')) {
     const v = qs.get('orbit').split(',').map(Number);
     orbit.yaw = (v[0] || 0) * D2R; orbit.pitch = (v[1] || 0) * D2R; orbit.dist = v[2] || orbit.dist;
@@ -470,11 +479,15 @@ async function main() {
     keys[e.code] = true;
     if (e.code === 'KeyH') togglePanel();
     if (e.code === 'KeyF') toggleFreeCam();
+    if (e.code === 'KeyG') storm.target = 1 - storm.target;
+    if (e.code === 'KeyV' && !orbit.freeCam) { orbit.view = (orbit.view + 1) % VIEWS.length; viewLook.yaw = 0; viewLook.pitch = 0; }
+    if (e.code === 'KeyM') music.toggle();
+    music.start();
     if (e.code.startsWith('Arrow') || e.code === 'Space') e.preventDefault();
   });
   addEventListener('keyup', (e) => { keys[e.code] = false; });
   addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
-  canvas.addEventListener('click', () => { if (document.pointerLockElement !== canvas) canvas.requestPointerLock(); });
+  canvas.addEventListener('click', () => { music.start(); if (document.pointerLockElement !== canvas) canvas.requestPointerLock(); });
   let dragging = false;
   canvas.addEventListener('mousedown', (e) => { if (e.button === 2) dragging = true; });
   addEventListener('mouseup', () => { dragging = false; });
@@ -484,15 +497,18 @@ async function main() {
       if (orbit.freeCam) {
         cam.yaw += e.movementX * 0.0022;
         cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch - e.movementY * 0.0022));
-      } else {
+      } else if (orbit.view === 0) {
         orbit.yaw += e.movementX * 0.0022;
         orbit.pitch = Math.max(-1.2, Math.min(0.5, orbit.pitch - e.movementY * 0.0022));
+      } else {
+        viewLook.yaw = Math.max(-2.2, Math.min(2.2, viewLook.yaw + e.movementX * 0.0022));
+        viewLook.pitch = Math.max(-1.2, Math.min(1.2, viewLook.pitch - e.movementY * 0.0022));
       }
     }
   });
   addEventListener('wheel', (e) => {
     if (orbit.freeCam) cam.speed = Math.max(0.5, Math.min(400, cam.speed * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
-    else orbit.dist = Math.max(14, Math.min(400, orbit.dist * (e.deltaY < 0 ? 1 / 1.1 : 1.1)));
+    else if (orbit.view === 0) orbit.dist = Math.max(14, Math.min(400, orbit.dist * (e.deltaY < 0 ? 1 / 1.1 : 1.1)));
   }, { passive: true });
   function toggleFreeCam() {
     orbit.freeCam = !orbit.freeCam;
@@ -500,9 +516,51 @@ async function main() {
     // keep the current view when leaving the chase camera
     cam.speed = 12;
   }
+  // ---- weather: G blends the evening sea into a storm and back ----
+  const STORM = { windSpeed: 14, swellHs: 3.6, swellLength: 170, choppy: 1.35, foam: 1.25, clouds: 0.85, veil: 0.75, haze: 5.5, exposure: 1.55 };
+  const CALM = {};   // filled on the first frame, after URL parameters were applied
+  const storm = { t: 0, target: qs.get('storm') === '1' ? 1 : 0 };
+  if (storm.target) storm.t = 1;
+  function updateWeather(dt) {
+    if (!('windSpeed' in CALM)) for (const k in STORM) CALM[k] = P[k];
+    const before = storm.t;
+    storm.t += Math.sign(storm.target - storm.t) * Math.min(Math.abs(storm.target - storm.t), dt / 8);
+    if (storm.t === before && !(storm.t === 1 && frameIndex <= 1)) return;
+    const e = storm.t * storm.t * (3 - 2 * storm.t);
+    for (const k in STORM) P[k] = CALM[k] + (STORM[k] - CALM[k]) * e;
+    needSpectrum = true;
+    needLUT = true;
+    envFull = 1;
+  }
+
+  // ---- music: the shanty starts with the first key press or click (autoplay rules) ----
+  const music = (() => {
+    const el = new Audio();
+    el.loop = true;
+    el.volume = 0.4;
+    el.src = typeof MUSIC_B64 !== 'undefined' ? 'data:audio/mpeg;base64,' + MUSIC_B64 : 'assets/shanty.mp3'; // eslint-disable-line no-undef
+    let started = false, muted = qs.get('music') === '0';
+    return {
+      start() { if (!started && !muted) { started = true; el.play().catch(() => { started = false; }); } },
+      toggle() { muted = !muted; el.muted = muted; if (!muted) this.start(); },
+    };
+  })();
+
   const camTarget = [0, 0, 0];
   let camLift = 0;
+  const eyeW = [0, 0, 0];
+  function updateHelmCamera() {
+    const st = ship.st, e = ship.crewEye;
+    // eyes: just in front of his face; helm: over his shoulder, a little above and behind
+    // (eyes a little higher than his, so the top spoke of the wheel is not right in the face)
+    if (orbit.view === 2) ship.toWorld(e[0], e[1] + 0.25, e[2] + 0.3, eyeW);
+    else ship.toWorld(e[0] + 0.55, e[1] + 0.55, e[2] + 2.3, eyeW);
+    cam.x = eyeW[0]; cam.y = eyeW[1]; cam.z = eyeW[2];
+    cam.yaw = st.yaw + viewLook.yaw;
+    cam.pitch = viewLook.pitch + (orbit.view === 2 ? -0.32 : -0.16) + st.tiltX * 0.6;
+  }
   function updateChaseCamera(dt) {
+    if (orbit.view !== 0) { updateHelmCamera(); return; }
     const st = ship.st;
     cam.yaw = st.yaw + orbit.yaw;
     cam.pitch = orbit.pitch;
@@ -715,6 +773,23 @@ async function main() {
   let fpsAcc = 0, fpsN = 0, fpsT = 0;
   let shooting = false;
 
+  // Lower the resolution while the GPU cannot keep ~60 fps; raise it again when there is
+  // clear headroom. Steps are coarse and rare, since every change reallocates targets.
+  let scaleCalm = 0, scaleBusy = 0;
+  function adaptScale(fps) {
+    if (fixedScale || shotName || Number(qs.get('w'))) return;
+    const busy = hasTS ? gpuMs : 1000 / fps;
+    const max = 1;
+    if ((fps < 52 || busy > 15.5) && renderScale > 0.4) {
+      // two slow half-second windows in a row, so a single hiccup does not count
+      if (++scaleBusy >= 2) { renderScale = Math.max(0.4, renderScale * 0.85); scaleBusy = 0; }
+      scaleCalm = 0;
+    } else if (busy < 9.5 && fps > 57 && renderScale < max) {
+      if (++scaleCalm >= 4) { renderScale = Math.min(max, renderScale * 1.12); scaleCalm = 0; }
+      scaleBusy = 0;
+    } else { scaleCalm = 0; scaleBusy = 0; }
+  }
+
   function encodeSim(cp) {
     cp.setPipeline(evolvePipe);
     cp.setBindGroup(0, bgEvolve);
@@ -779,10 +854,12 @@ async function main() {
       const fps = fpsN / fpsAcc;
       hudFps.textContent = `${fps.toFixed(0)} fps  ${(1000 / fps).toFixed(2)} ms` +
         (hasTS ? `  |  GPU ${gpuMs.toFixed(2)} ms` : '') + `  |  ${nodeCount} nodes  ${W}x${H}`;
+      adaptScale(fps);
       fpsAcc = 0; fpsN = 0; fpsT = 0;
     }
     if (fixedDt) dt = fixedDt;
-    ship.update(dt, orbit.freeCam ? {} : keys, P.windDir);
+    updateWeather(dt);
+    ship.update(dt, orbit.freeCam ? {} : keys, P.windDir, P.windSpeed, P.swellHs);
     if (orbit.freeCam) updateCamera(dt); else updateChaseCamera(dt);
     if (fpsN === 0) {
       const st = ship.st;
@@ -796,7 +873,7 @@ async function main() {
     frameIndex++;
 
     writeFrame(simTime);
-    ship.writeUniforms(cam, frameF.subarray(32, 35), simTime);
+    ship.writeUniforms(cam, frameF.subarray(32, 35), simTime, !orbit.freeCam && orbit.view === 2);
     writeSimStatic();
     simF[52] = simTime; simF[53] = dt;
     device.queue.writeBuffer(simUBO, 0, simF);
