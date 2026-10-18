@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Ocean — WebGPU</title>
+<title>Pirate Ocean — WebGPU</title>
 <style>
   html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
   #c { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: crosshair; }
@@ -16,6 +16,14 @@
   #panel label { display: grid; grid-template-columns: 1fr 110px 40px; gap: 6px; align-items: center; margin: 3px 0; }
   #panel input { width: 110px; accent-color: #e2a04e; }
   #panel output { text-align: right; font-variant-numeric: tabular-nums; opacity: .8; }
+  #nav { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); display: flex; gap: 22px; align-items: end;
+         padding: 10px 18px; border-radius: 10px; background: #0b0f1488; backdrop-filter: blur(6px);
+         color: #efe4cc; font: 12px/1.2 Georgia, 'Times New Roman', serif; letter-spacing: .04em; pointer-events: none; user-select: none; }
+  #nav b { display: block; font: 600 22px/1 Georgia, serif; font-variant-numeric: tabular-nums; }
+  #nav small { opacity: .65; text-transform: uppercase; font-size: 10px; }
+  #nav .sail { width: 120px; }
+  #nav .track { height: 6px; margin-top: 7px; border-radius: 3px; background: #ffffff22; overflow: hidden; }
+  #sailbar { height: 100%; width: 60%; background: #e2a04e; }
   #err { position: fixed; inset: 0; display: none; padding: 40px; color: #f88; font: 16px system-ui; white-space: pre-wrap; background: #000; }
 </style>
 </head>
@@ -23,7 +31,12 @@
 <canvas id="c"></canvas>
 <div id="hud">
   <div id="fps">starting…</div>
-  <div class="help">click: mouse look · WASD move · Space/E up · Q/C down · Shift fast · wheel speed · H panel</div>
+  <div class="help">W/S sails · A/D helm · click or right-drag: look around · wheel zoom · F free camera · H panel</div>
+</div>
+<div id="nav">
+  <div><small>Speed (kn)</small><b class="spd">0.0</b></div>
+  <div><small>Heading</small><b class="hdg">000°</b></div>
+  <div class="sail"><small>Sails</small><div class="track"><div id="sailbar"></div></div></div>
 </div>
 <div id="panel" class="hidden"></div>
 <div id="err"></div>

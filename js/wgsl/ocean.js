@@ -1,6 +1,7 @@
 // Ocean surface + sky background rendering.
 import { FRAME_WGSL, ATMO_CORE_WGSL, ENV_MIPS, ENV_SIZE, N, CASCADES } from './common.js';
 import { SKY_RENDER_FUNCS, SKY_CLOUD_FUNCS } from './sky.js';
+import { SHIP_WGSL, SHADOW_FUNCS } from './ship.js';
 
 const RENDER_BINDINGS = /* wgsl */ `
 @group(0) @binding(0) var<uniform> F: Frame;
@@ -39,7 +40,7 @@ struct VO { @builtin(position) pos: vec4f, @location(0) ndc: vec2f };
 }
 `;
 
-export const OCEAN = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + /* wgsl */ `
+export const OCEAN = FRAME_WGSL + ATMO_CORE_WGSL + SHIP_WGSL + RENDER_BINDINGS + /* wgsl */ `
 @group(0) @binding(4) var dispTex: texture_2d_array<f32>;
 @group(0) @binding(5) var derivTex: texture_2d_array<f32>;
 @group(0) @binding(6) var momTex: texture_2d_array<f32>;
@@ -48,13 +49,17 @@ export const OCEAN = FRAME_WGSL + ATMO_CORE_WGSL + RENDER_BINDINGS + /* wgsl */ 
 @group(0) @binding(9) var sampR: sampler;
 @group(0) @binding(10) var foamWorld: texture_2d_array<f32>;
 @group(0) @binding(11) var<storage, read> sunVis: array<f32, 4>;
-` + SKY_RENDER_FUNCS + /* wgsl */ `
+@group(0) @binding(12) var<uniform> S: Ship;
+@group(0) @binding(13) var shadowMap: texture_depth_2d;
+@group(0) @binding(14) var shadowSamp: sampler_comparison;
+@group(0) @binding(15) var shipRefl: texture_2d<f32>;
+` + SKY_RENDER_FUNCS + SHADOW_FUNCS + /* wgsl */ `
 const ENV_MAXMIP: f32 = ${ENV_MIPS - 1}.0;
 const ENV_TEXELS_PER_RAD: f32 = ${ENV_SIZE}.0 / 1.5708;
 const TEX_N: f32 = ${N}.0;
 
 struct VSOut {
-  @builtin(position) pos: vec4f,
+  @builtin(position) pos: vec4f,   // fragment stage: framebuffer coordinates
   @location(0) rel: vec3f,     // displaced position relative to the camera
   @location(1) xz: vec2f,      // undisplaced (lagrangian) coordinates
   @location(2) height: f32,
@@ -154,7 +159,8 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   cov += aa * min(1.0, 0.03 / max(max(aa.x, aa.y), 1e-8));
   let J = (1.0 + jxx) * (1.0 + jzz) - jxz * jxz;
 
-  let sunE = sunIlluminance() * sunVis[0];
+  // the ship's shadow falls on the water (and hides the glitter behind it)
+  let sunE = sunIlluminance() * sunVis[0] * sunShadow(in.rel, 2.5);
   let skyUp = textureSampleLevel(envCube, sampC, vec3f(0.0, 1.0, 0.0), ENV_MAXMIP).rgb;
   // average radiance of the whole upper hemisphere (incl. the bright horizon band)
   let skyHemi = skyUp * 0.4 + 0.15 * (
@@ -190,7 +196,15 @@ fn foamPattern(xz: vec2f, t: f32) -> f32 {
   R.y = abs(R.y) * 0.4 + max(R.y, 0.0) * 0.6;
   R = normalize(R);
   let envLod = clamp(log2(max(2.0 * sig * ENV_TEXELS_PER_RAD, 1.0)), 0.0, ENV_MAXMIP);
-  let refl = textureSampleLevel(envCube, sampC, R, envLod).rgb;
+  var refl = textureSampleLevel(envCube, sampC, R, envLod).rgb;
+  // the ship's mirror image, wobbled by the wave slopes
+  // (three taps along the slope smear it the way a rough sea stretches reflections)
+  let suv = in.pos.xy * F.screen.zw;
+  let sk = vec2f(sl.x * 0.5, -sl.y) * clamp(22.0 / dist, 0.03, 0.18);
+  let sr = (textureSampleLevel(shipRefl, sampC, suv - sk * 0.5, 0.0) +
+            textureSampleLevel(shipRefl, sampC, suv + sk * 0.5, 0.0) +
+            textureSampleLevel(shipRefl, sampC, suv + sk * 1.5, 0.0)) / 3.0;
+  refl = mix(refl, sr.rgb, sr.a * 0.9);
   let NdV = max(dot(nV, V), 0.0);
   // Fresnel from a partially smoothed normal: the long-wave facet plus the grazing-angle
   // statistics of everything finer (visible facets at grazing incidence stay highly reflective)

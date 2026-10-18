@@ -7,6 +7,7 @@ import { SIM_INIT, SIM_EVOLVE, FFT_ROWS, FFT_COLS, SIM_MIPS, FOAM_TEX, RGBA8_MIP
 import { TRANS_LUT, MS_LUT, SKYVIEW_LUT, ENV_CUBE, CUBE_MIPS, SUN_VIS } from './wgsl/sky.js';
 import { OCEAN, SKY_BG, HEIGHT_PROBE } from './wgsl/ocean.js';
 import { BLOOM_DOWN, BLOOM_UP, COMPOSITE } from './wgsl/post.js';
+import { createShip } from './ship.js';
 
 const qs = new URLSearchParams(location.search);
 const DBG = Number(qs.get('dbg')) || 0;
@@ -185,8 +186,8 @@ async function main() {
     label: 'foam world ' + i, size: [FOAM_RES, FOAM_RES, 2], format: 'rgba16float', mipLevelCount: FOAMW_MIPS,
     usage: TU.TEXTURE_BINDING | TU.STORAGE_BINDING,
   }));
-  const foamUBO = mkBuf(144, GU.UNIFORM | GU.COPY_DST, 'foam ubo');
-  const foamUArr = new ArrayBuffer(144);
+  const foamUBO = mkBuf(176, GU.UNIFORM | GU.COPY_DST, 'foam ubo');
+  const foamUArr = new ArrayBuffer(176);
   const foamUI = new Int32Array(foamUArr);
   const foamUF = new Float32Array(foamUArr);
   const foamSnap = new Int32Array(4);  // previous camera texel per level
@@ -195,8 +196,6 @@ async function main() {
   const samplerSim = device.createSampler({
     magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat',
   });
-  const bgFoamUpd = [0, 1].map((i) => bg(foamUpdPipe, [{ buffer: foamUBO }, lvl(foamW[1 - i], 0), lvl(foamW[i], 0),
-    fullArr(dispTex), fullArr(derivTex), samplerSim, samplerSim], 'foamupd' + i));
   const bgFoamMips = [0, 1].map((i) => {
     const out = [];
     for (let m = 1; m < FOAMW_MIPS; m++) out.push(bg(arr16MipPipe, [lvl(foamW[i], m - 1), lvl(foamW[i], m)]));
@@ -287,9 +286,19 @@ async function main() {
     fragment: { module: compMod, entryPoint: 'fs', targets: [{ format: swapFormat }] },
   });
 
-  const bgOcean = [0, 1].map((i) => bg(oceanPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp,
-    fullArr(dispTex), fullArr(derivTex), fullArr(momTex), foamTex.createView(), envCubeView, sampRepeat,
-    fullArr(foamW[i]), { buffer: sunVisBuf }], 'ocean' + i));
+  const ship = await createShip(device, {
+    shader, computePipe, HDR, MSAA, frameUBO, transView, skyView, sampClamp, envCubeView, sunVisBuf,
+    dispView: fullArr(dispTex), samplerSim,
+  });
+  const bgFoamUpd = [0, 1].map((i) => bg(foamUpdPipe, [{ buffer: foamUBO }, lvl(foamW[1 - i], 0), lvl(foamW[i], 0),
+    fullArr(dispTex), fullArr(derivTex), samplerSim, samplerSim, { buffer: ship.hullBuf }], 'foamupd' + i));
+  // rebuilt on resize, because the ship reflection target follows the screen size
+  let bgOcean = [];
+  const makeOceanBG = (reflView) => {
+    bgOcean = [0, 1].map((i) => bg(oceanPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp,
+      fullArr(dispTex), fullArr(derivTex), fullArr(momTex), foamTex.createView(), envCubeView, sampRepeat,
+      fullArr(foamW[i]), { buffer: sunVisBuf }, { buffer: ship.ubo }, ship.shadowView, ship.shadowSamp, reflView], 'ocean' + i));
+  };
   const bgSky = bg(skyPipe, [{ buffer: frameUBO }, transView, skyView, sampClamp], 'sky');
 
   // Water height under the camera (async readback, a few frames of latency) so the
@@ -390,6 +399,7 @@ async function main() {
       upPasses.push({ colorAttachments: [{ view: bv[m - 1], loadOp: 'load', storeOp: 'store' }] });
     }
     bgComp = bg(compPipe, [hdrView, bv[0], linSamp, { buffer: compUBO }]);
+    makeOceanBG(ship.resize(W, H));
   }
 
   // --------------------------------------------------------------------------------------
@@ -443,13 +453,25 @@ async function main() {
   // Camera & input
   // --------------------------------------------------------------------------------------
   const cam = { x: 0, y: 2.4, z: 0, yaw: 0, pitch: -5.5 * D2R, fovY: 58 * D2R, speed: 6 };
+  // ship camera: orbits the ship; yaw is relative to the ship's heading so it turns with it
+  const orbit = { yaw: 155 * D2R, pitch: -12 * D2R, dist: 62, freeCam: false };
+  if (qs.get('orbit')) {
+    const v = qs.get('orbit').split(',').map(Number);
+    orbit.yaw = (v[0] || 0) * D2R; orbit.pitch = (v[1] || 0) * D2R; orbit.dist = v[2] || orbit.dist;
+  }
   if (qs.get('cam')) {
     const v = qs.get('cam').split(',').map(Number);
     cam.x = v[0]; cam.y = v[1]; cam.z = v[2]; cam.yaw = (v[3] || 0) * D2R; cam.pitch = (v[4] || 0) * D2R;
+    orbit.freeCam = true;
   }
   if (qs.get('fov')) cam.fovY = Number(qs.get('fov')) * D2R;
   const keys = Object.create(null);
-  addEventListener('keydown', (e) => { keys[e.code] = true; if (e.code === 'KeyH') togglePanel(); });
+  addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    if (e.code === 'KeyH') togglePanel();
+    if (e.code === 'KeyF') toggleFreeCam();
+    if (e.code.startsWith('Arrow') || e.code === 'Space') e.preventDefault();
+  });
   addEventListener('keyup', (e) => { keys[e.code] = false; });
   addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
   canvas.addEventListener('click', () => { if (document.pointerLockElement !== canvas) canvas.requestPointerLock(); });
@@ -459,13 +481,45 @@ async function main() {
   canvas.addEventListener('contextmenu', (e) => e.preventDefault());
   addEventListener('mousemove', (e) => {
     if (document.pointerLockElement === canvas || dragging) {
-      cam.yaw += e.movementX * 0.0022;
-      cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch - e.movementY * 0.0022));
+      if (orbit.freeCam) {
+        cam.yaw += e.movementX * 0.0022;
+        cam.pitch = Math.max(-1.5, Math.min(1.5, cam.pitch - e.movementY * 0.0022));
+      } else {
+        orbit.yaw += e.movementX * 0.0022;
+        orbit.pitch = Math.max(-1.2, Math.min(0.5, orbit.pitch - e.movementY * 0.0022));
+      }
     }
   });
   addEventListener('wheel', (e) => {
-    cam.speed = Math.max(0.5, Math.min(400, cam.speed * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+    if (orbit.freeCam) cam.speed = Math.max(0.5, Math.min(400, cam.speed * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+    else orbit.dist = Math.max(14, Math.min(400, orbit.dist * (e.deltaY < 0 ? 1 / 1.1 : 1.1)));
   }, { passive: true });
+  function toggleFreeCam() {
+    orbit.freeCam = !orbit.freeCam;
+    if (!orbit.freeCam) return;
+    // keep the current view when leaving the chase camera
+    cam.speed = 12;
+  }
+  const camTarget = [0, 0, 0];
+  let camLift = 0;
+  function updateChaseCamera(dt) {
+    const st = ship.st;
+    cam.yaw = st.yaw + orbit.yaw;
+    cam.pitch = orbit.pitch;
+    // look at a point above the deck; follow the heave only partly so the view stays calm
+    ship.toWorld(0, 0, st.midZ, camTarget);
+    camLift += (camTarget[1] * 0.5 - camLift) * Math.min(1, dt * 2);
+    const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw), cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
+    const ty = 7 + camLift;
+    cam.x = camTarget[0] - cp * sy * orbit.dist;
+    cam.y = ty - sp * orbit.dist;
+    cam.z = camTarget[2] + cp * cy * orbit.dist;
+    if (cam.y < waterH + 1.2) {
+      // camera pushed up by the sea: tilt down so the ship stays in frame
+      cam.y = waterH + 1.2;
+      cam.pitch = Math.atan2(ty - cam.y, Math.hypot(cam.x - camTarget[0], cam.z - camTarget[2]));
+    }
+  }
 
   function updateCamera(dt) {
     const cy = Math.cos(cam.yaw), sy = Math.sin(cam.yaw), cp = Math.cos(cam.pitch), sp = Math.sin(cam.pitch);
@@ -637,10 +691,16 @@ async function main() {
     row.append(name, inp, val);
     panel.appendChild(row);
   }
-  if (qs.get('ui') === '0') { document.getElementById('hud').style.display = 'none'; panel.classList.add('hidden'); }
+  if (qs.get('ui') === '0') {
+    document.getElementById('hud').style.display = 'none';
+    document.getElementById('nav').style.display = 'none';
+    panel.classList.add('hidden');
+  }
   for (const k of Object.keys(P)) if (qs.has(k)) P[k] = Number(qs.get(k));
 
   const hudFps = document.getElementById('fps');
+  const hudNav = document.getElementById('nav');
+  const sailBar = document.getElementById('sailbar');
 
   // --------------------------------------------------------------------------------------
   // Frame
@@ -702,6 +762,9 @@ async function main() {
     for (let c = 0; c < C; c++) { foamUF[16 + c] = CASC_L[c]; foamUF[24 + c] = 1 / CASC_L[c]; }
     const drift = 0.03 * P.windSpeed;
     foamUF[32] = Math.cos(P.windDir * D2R) * drift; foamUF[33] = Math.sin(P.windDir * D2R) * drift;
+    const st = ship.st;
+    foamUF[36] = st.x; foamUF[37] = st.z; foamUF[38] = Math.sin(st.yaw); foamUF[39] = -Math.cos(st.yaw);
+    foamUF[40] = st.speed; foamUF[41] = st.halfLen; foamUF[42] = st.beam; foamUF[43] = st.midZ;
     device.queue.writeBuffer(foamUBO, 0, foamUArr);
   }
 
@@ -719,12 +782,21 @@ async function main() {
       fpsAcc = 0; fpsN = 0; fpsT = 0;
     }
     if (fixedDt) dt = fixedDt;
-    updateCamera(dt);
+    ship.update(dt, orbit.freeCam ? {} : keys, P.windDir);
+    if (orbit.freeCam) updateCamera(dt); else updateChaseCamera(dt);
+    if (fpsN === 0) {
+      const st = ship.st;
+      const hdg = ((st.yaw / D2R) % 360 + 360) % 360;
+      hudNav.querySelector('.spd').textContent = (st.speed * 1.944).toFixed(1);
+      hudNav.querySelector('.hdg').textContent = String(Math.round(hdg)).padStart(3, '0') + '°';
+      sailBar.style.width = (st.sail * 100).toFixed(0) + '%';
+    }
     simTime += dt;
     if (simTime > LOOP) simTime -= LOOP;
     frameIndex++;
 
     writeFrame(simTime);
+    ship.writeUniforms(cam, frameF.subarray(32, 35), simTime);
     writeSimStatic();
     simF[52] = simTime; simF[53] = dt;
     device.queue.writeBuffer(simUBO, 0, simF);
@@ -752,6 +824,7 @@ async function main() {
       needLUT = false;
     }
     encodeSim(cp);
+    ship.encodeCompute(cp);
     cp.setPipeline(probePipe);
     cp.setBindGroup(0, bgProbe);
     cp.dispatchWorkgroups(1);
@@ -773,8 +846,11 @@ async function main() {
       cp.dispatchWorkgroups(Math.ceil(s / 8), Math.ceil(s / 8), 6);
     }
     cp.end();
+    ship.encodeShadow(enc);
+    ship.encodeReflection(enc);
 
     const rp = enc.beginRenderPass(mainPass);
+    ship.draw(rp);
     if (nodeCount) {
       rp.setPipeline(oceanPipe);
       rp.setBindGroup(0, bgOcean[foamCur]);
@@ -834,6 +910,7 @@ async function main() {
     }
     submitList[0] = enc.finish();
     device.queue.submit(submitList);
+    ship.afterSubmit();
     if (doProbe) { probePending = true; probeRead.mapAsync(GPUMapMode.READ).then(onProbe, onProbeFail); }
     if (doTs) { tsPending = true; tsRead.mapAsync(GPUMapMode.READ).then(onTsMapped, onTsFail); }
     if (readBuf) saveShot(readBuf, Math.ceil(W * 4 / 256) * 256, true);

@@ -11,8 +11,8 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
-const wgslModules = ['js/wgsl/common.js', 'js/wgsl/sim.js', 'js/wgsl/sky.js', 'js/wgsl/ocean.js', 'js/wgsl/post.js'];
-const order = [...wgslModules, 'js/main.js'];
+const wgslModules = ['js/wgsl/common.js', 'js/wgsl/sky.js', 'js/wgsl/ship.js', 'js/wgsl/sim.js', 'js/wgsl/ocean.js', 'js/wgsl/post.js'];
+const order = [...wgslModules, 'js/ship.js', 'js/main.js'];
 const stripModuleSyntax = (src) => src
   .replace(/^import[\s\S]*?from\s+['"][^'"]+['"];\s*$/gm, '')                 // drop imports
   .replace(/^export\s+(const|function|async function|let|class)\s/gm, '$1 ');
@@ -25,7 +25,10 @@ const write = (name, html) => {
 };
 
 // ---- readable bundle --------------------------------------------------------------------
-let code = '';
+// the ship mesh travels inside the page as base64 (js/ship.js picks it up)
+const shipB64 = fs.readFileSync(path.join(root, 'assets/ship.bin')).toString('base64');
+const shipConst = `const SHIP_B64 = '${shipB64}';\n`;
+let code = shipConst;
 for (const f of order) code += `// ---- ${f} ----\n${stripModuleSyntax(fs.readFileSync(path.join(root, f), 'utf8'))}\n`;
 write('ocean.html', page.replace(SCRIPT_TAG, () => `<script type="module">\n${code}\n</script>`));
 
@@ -54,6 +57,7 @@ function minifyTemplates(src) {
 }
 let minJs = '';
 for (const f of wgslModules) minJs += stripModuleSyntax(minifyTemplates(fs.readFileSync(path.join(root, f), 'utf8'))) + '\n';
+minJs += stripModuleSyntax(fs.readFileSync(path.join(root, 'js/ship.js'), 'utf8')) + '\n';
 minJs += stripModuleSyntax(fs.readFileSync(path.join(root, 'js/main.js'), 'utf8'));
 
 function findEsbuild() {
@@ -77,7 +81,7 @@ if (esbuild) {
 }
 
 const minPage = page
-  .replace(SCRIPT_TAG, () => `<script type="module">${minJs}</script>`)
+  .replace(SCRIPT_TAG, () => `<script type="module">${shipConst}${minJs}</script>`)
   .replace(/<style>([\s\S]*?)<\/style>/, (_, css) => `<style>${css.replace(/\s+/g, ' ').replace(/ ?([{}:;,>]) ?/g, '$1').trim()}</style>`)
   .replace(/>\s+</g, '><');
 write('ocean.min.html', minPage);

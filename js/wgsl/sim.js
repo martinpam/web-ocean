@@ -1,5 +1,6 @@
 // FFT ocean simulation (Tessendorf) — 4 cascades of 256^2.
 import { N, LOGN, CASCADES, NOISE_WGSL, PERIODIC_WGSL } from './common.js';
+import { HULL_WGSL } from './ship.js';
 
 const SIM_STRUCT = /* wgsl */ `
 const N: u32 = ${N}u;
@@ -345,7 +346,7 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
 // World-space foam clipmaps (toroidally addressed, centred on the camera).
 // Foam is injected where the TOTAL surface Jacobian (all cascades) folds, then decays.
 export const FOAM_RES = 1024;
-export const FOAM_UPDATE = /* wgsl */ `
+export const FOAM_UPDATE = NOISE_WGSL + /* wgsl */ `
 const RES: i32 = ${FOAM_RES};
 struct FoamU {
   snap: array<vec4i, 2>,     // per level: current camera texel (x, z), previous (x, z)
@@ -354,6 +355,8 @@ struct FoamU {
   cascL: array<vec4f, 2>,
   cascInvL: array<vec4f, 2>,
   drift: vec4f,              // foam drift velocity (m/s) xz
+  ship0: vec4f,              // ship position xz, forward direction xz
+  ship1: vec4f,              // ship speed (m/s), waterline half length, half beam, waterline centre (local z)
 };
 @group(0) @binding(0) var<uniform> U: FoamU;
 @group(0) @binding(1) var prevTex: texture_2d_array<f32>;
@@ -362,6 +365,49 @@ struct FoamU {
 @group(0) @binding(4) var derivTex: texture_2d_array<f32>;
 @group(0) @binding(5) var samp: sampler;
 @group(0) @binding(6) var sampPrev: sampler;
+@group(0) @binding(7) var<storage, read> hull: array<f32>;
+` + HULL_WGSL + /* wgsl */ `
+
+// Foam the ship churns up: a band along the hull, the bow wave, the two Kelvin wake arms
+// (19.5 degrees) and the turbulent wake behind the stern. Stationary relative to the ship;
+// the foam left behind decays and drifts like any other foam.
+fn shipFoam(p: vec2f) -> f32 {
+  let d = p - U.ship0.xy;
+  let fw = U.ship0.zw;
+  let lx = dot(d, vec2f(-fw.y, fw.x));
+  let lz = -dot(d, fw);
+  let ax = abs(lx);
+  if (ax > 160.0 || lz < U.ship1.w - U.ship1.y - 8.0 || lz > U.ship1.w + 260.0) { return 0.0; }
+  let sp = clamp(U.ship1.x / 6.0, 0.0, 1.0);
+  let bowZ = U.ship1.w - U.ship1.y;
+  let sternZ = U.ship1.w + U.ship1.y;
+  let hw = hullHalfWidth(lz);
+  var f = 0.0;
+  if (hw > 0.05) {
+    let e = ax - hw;
+    let ring = (1.0 - smoothstep(0.0, 0.9 + 0.8 * sp, e)) * step(-0.25, e);
+    let bow = exp(-max(lz - bowZ, 0.0) / (3.0 + 4.0 * sp));
+    f = ring * (0.22 + 0.45 * sp + bow * (0.25 + 0.9 * sp));
+  }
+  let s = lz - bowZ;
+  if (s > 0.0) {
+    let arm = U.ship1.z * 0.8 + 0.36 * s;
+    let w = 0.35 + 0.035 * s;
+    let k = exp(-abs(ax - arm) / w) * exp(-s / 70.0) * sp * 0.8;
+    f = max(f, k * smoothstep(2.0, 10.0, s));
+  }
+  let s2 = lz - sternZ;
+  if (s2 > -1.0) {
+    // churned water: a turbulent core that widens and tears into patches
+    let half = U.ship1.z * (0.7 + 0.05 * max(s2, 0.0));
+    let core = 1.0 - smoothstep(half * 0.3, half, ax);
+    let tear = smoothstep(-0.25, 0.45, gnoise(p * 0.32) + 0.6 * gnoise(p * 1.05 + 17.0) - max(s2, 0.0) * 0.006);
+    let edge = exp(-abs(ax - half * 0.8) / 0.6) * 0.5;
+    f = max(f, max(core * tear, edge) * exp(-max(s2, 0.0) / 38.0) * sp * 0.85);
+  }
+  // a little texture everywhere so the shapes never read as flat bands
+  return f * (0.75 + 0.25 * gnoise(p * 2.3 + 3.0));
+}
 
 fn wrapIdx(i: i32, lo: i32) -> i32 { return lo + (((i - lo) % RES) + RES) % RES; }
 
@@ -394,12 +440,13 @@ fn main(@builtin(global_invocation_id) id: vec3u) {
     prev = textureSampleLevel(prevTex, sampPrev, back, lvl, 0.0);
   }
   let dt = U.p0.z;
-  let inject = clamp((U.p1.x - J) * U.p1.y, 0.0, 1.0);
+  let sf = shipFoam(p);
+  let inject = max(clamp((U.p1.x - J) * U.p1.y, 0.0, 1.0), sf);
   var f = prev.r * exp(-dt * U.p0.w);
   f = max(f, inject);
   f = min(f + inject * dt * U.p1.z, 1.6);
   // g: freshness (recently injected) used for brighter, denser crest foam
-  let fresh = max(prev.g * exp(-dt * 1.6), inject);
+  let fresh = max(prev.g * exp(-dt * 1.6), max(inject - sf, sf * 0.55));
   textureStore(dst, id.xy, lvl, vec4f(f, fresh, J, 1.0));
 }
 `;
