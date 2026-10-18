@@ -3471,7 +3471,12 @@ async function main() {
   requestAnimationFrame(frame);
 }
 
-main().catch((e) => { log('init failed: ' + (e && e.stack || e)); });
+main().catch((e) => {
+  log('init failed: ' + (e && e.stack || e));
+  // show it instead of hanging on "starting…" (fail() has already filled the panel)
+  const el = document.getElementById('err');
+  if (el.style.display !== 'block') { el.style.display = 'block'; el.textContent = 'Could not start: ' + (e && e.message || e); }
+});
 
 
 </script>

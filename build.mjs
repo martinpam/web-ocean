@@ -86,3 +86,13 @@ const minPage = page
   .replace(/<style>([\s\S]*?)<\/style>/, (_, css) => `<style>${css.replace(/\s+/g, ' ').replace(/ ?([{}:;,>]) ?/g, '$1').trim()}</style>`)
   .replace(/>\s+</g, '><');
 write('ocean.min.html', minPage);
+
+// ---- static site for hosting (Vercel serves dist/, see vercel.json) -----------------------
+// The module page loads js/ and assets/ itself; the two bundles sit next to it.
+const dist = path.join(root, 'dist');
+fs.rmSync(dist, { recursive: true, force: true });
+fs.mkdirSync(path.join(dist, 'assets'), { recursive: true });
+for (const f of ['index.html', 'ocean.html', 'ocean.min.html']) fs.copyFileSync(path.join(root, f), path.join(dist, f));
+fs.cpSync(path.join(root, 'js'), path.join(dist, 'js'), { recursive: true });
+for (const f of ['ship.bin', 'shanty.mp3']) fs.copyFileSync(path.join(root, 'assets', f), path.join(dist, 'assets', f));
+console.log('wrote dist/');
